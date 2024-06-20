@@ -10,3 +10,10 @@
     - `pip install datatable`
 
 
+## Example 1: Calling metacells for a single-cell dataset
+
+Users can refer to [here](https://github.com/ZengFLab/SURE_example_1) for details.
+
+## Example 2: The hierarchical assembly of large-scale dataset(s)
+
+Users can refer to here for details. 
