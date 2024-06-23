@@ -9,7 +9,7 @@
 
     - `pip install datatable`
 
-    - Following instructions [here](https://github.com/dpeerlab/SEACells) for installing SEACells
+    - To install SEACells please follow the instructions [here](https://github.com/dpeerlab/SEACells)
 
 
 ## Example 1: Calling metacells for a single-cell dataset
