@@ -9,6 +9,8 @@
 
     - `pip install datatable`
 
+    - Following instructions [here](https://github.com/dpeerlab/SEACells) for installing SEACells
+
 
 ## Example 1: Calling metacells for a single-cell dataset
 
@@ -17,3 +19,5 @@ Users can refer to [here](https://github.com/ZengFLab/SURE_example_1) for detail
 ## Example 2: The hierarchical assembly of large-scale dataset(s)
 
 Users can refer to [here](https://github.com/ZengFLab/SURE_example_2) for details.
+
+## Example 3: Human brain cell atlas
