@@ -21,3 +21,5 @@ Users can refer to [here](https://github.com/ZengFLab/SURE_example_1) for detail
 Users can refer to [here](https://github.com/ZengFLab/SURE_example_2) for details.
 
 ## Example 3: Human brain cell atlas
+
+Users can refer to [here](https://github.com/ZengFLab/SURE_example_3) for details.
