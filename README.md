@@ -23,3 +23,8 @@ Users can refer to [here](https://github.com/ZengFLab/SURE_example_2) for detail
 ## Example 3: Human brain cell atlas
 
 Users can refer to [here](https://github.com/ZengFLab/SURE_example_3) for details.
+
+## Example 4: Metacell calling for scATAC-seq data
+
+Users can refer to [here](https://github.com/ZengFLab/SURE_example_4) for details.
+
