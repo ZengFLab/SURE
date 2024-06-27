@@ -1,5 +1,5 @@
 # SURE: SUccinct REpresentation of cells
- SURE introduces a vector quantization-based probabilistic generative model for calling metacells and use them as landmarks that form a coordinate system for cell ID.
+ SURE introduces a vector quantization-based probabilistic generative model for calling metacells and use them as landmarks that form a coordinate system for cell ID. Analyzing single-cell omics data in a manner analogous to reference genome-based genomic analysis.
 
 
 ## Installation
