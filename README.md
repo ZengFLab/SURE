@@ -28,6 +28,4 @@ Users can refer to [here](https://github.com/ZengFLab/SURE_example_3) for detail
 
 Users can refer to [here](https://github.com/ZengFLab/SURE_example_4) for details.
 
-## Example 5: Metacell calling for microbiome single-cell transcriptomics
-
 
