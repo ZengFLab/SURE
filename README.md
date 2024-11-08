@@ -1,7 +1,7 @@
 # SURE: SUccinct REpresentation of cells
  SURE introduces a vector quantization-based probabilistic generative model for calling metacells and use them as landmarks that form a coordinate system for cell ID. Analyzing single-cell omics data in a manner analogous to reference genome-based genomic analysis.
 
-## UPDATE
+## **UPDATE**
 An update has been distributed. Users can access to the update here, [SUREv2](https://github.com/ZengFLab/SUREv2). It provides Python classes that users can call SURE in scripts. It also provide the command that users can run SURE in the shell. Additionally, SUREv2 supports the calling of metacells for multi-omics datasets.
 
 ## Installation
