@@ -1,0 +1,4 @@
+dill==0.3.8
+scanpy
+pytorch-ignite
+datatable

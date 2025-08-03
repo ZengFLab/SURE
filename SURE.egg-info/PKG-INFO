@@ -1,3 +1,21 @@
+Metadata-Version: 2.1
+Name: SURE
+Version: 1.0
+Summary: Succinct Representation of Single Cells
+Home-page: https://github.com/ZengFLab/SUREv2
+Author: Feng Zeng
+Author-email: zengfeng@xmu.edu.cn
+Classifier: Programming Language :: Python :: 3
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Requires-Python: >=3.6
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: dill==0.3.8
+Requires-Dist: scanpy
+Requires-Dist: pytorch-ignite
+Requires-Dist: datatable
+
 # SURE: SUccinct REpresentation of cells
  SURE introduces a vector quantization-based probabilistic generative model for calling metacells and use them as landmarks that form a coordinate system for cell ID. Analyzing single-cell omics data in a manner analogous to reference genome-based genomic analysis.
 
