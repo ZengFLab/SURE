@@ -23,7 +23,7 @@ Requires-Dist: datatable
 An update has been distributed. Users can access to it via [SUREv2](https://github.com/ZengFLab/SUREv2). It provides Python classes that users can call SURE in scripts. It also provide the command that users can run SURE in the shell. Additionally, SUREv2 supports the calling of metacells for multi-omics datasets.
 
 ## Installation
-1. Download SUREv2 and enter the directory
+1. Download SURE and enter the directory
 ```bash
 git clone https://github.com/ZengFLab/SURE.git && cd SURE
 ```

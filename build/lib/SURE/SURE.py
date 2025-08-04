@@ -61,7 +61,7 @@ class SURE(nn.Module):
         Number of undesired factors. It would be used to adjust for undesired variations like batch effect.
     codebook_size
         Number of metacells.
-    z_dim
+    latent_dim
         Dimensionality of latent states and metacells. 
     hidden_layers
         A list give the numbers of neurons for each hidden layer.
@@ -97,7 +97,8 @@ class SURE(nn.Module):
                  undesired_size: int = 2,
                  codebook_size: int = 200,
                  supervised_mode: bool = False,
-                 z_dim: int = 10,
+                 latent_dim: int = 10,
+                 latent_dist: Literal['normal','studentt','laplacian','cauchy','gumbel'] = 'normal',
                  hidden_layers: list = [500],
                  hidden_layer_activation: Literal['relu','softplus','leakyrelu','linear'] = 'relu',
                  use_dirichlet: bool = True,
@@ -110,7 +111,6 @@ class SURE(nn.Module):
                  delta: float = 0.0,
                  post_layer_fct: list = ['layernorm'],
                  post_act_fct: list = None,
-                 latent_dist: Literal['normal','studentt','laplacian','cauchy','gumbel'] = 'normal',
                  config_enum: str = 'parallel',
                  use_cuda: bool = False,
                  dtype = torch.float32, # type: ignore
@@ -120,7 +120,7 @@ class SURE(nn.Module):
         self.input_size = input_size
         self.undesired_size = undesired_size
         self.inverse_dispersion = inverse_dispersion
-        self.z_dim = z_dim
+        self.latent_dim = latent_dim
         self.hidden_layers = hidden_layers
         self.decoder_hidden_layers = hidden_layers[::-1]
         self.use_undesired = True if self.undesired_size>0 else False
@@ -171,7 +171,7 @@ class SURE(nn.Module):
         self.setup_networks()
 
     def setup_networks(self):
-        z_dim = self.z_dim
+        latent_dim = self.latent_dim
         hidden_sizes = self.hidden_layers
 
         nn_layer_norm, nn_batch_norm, nn_layer_dropout = False, False, False
@@ -242,7 +242,7 @@ class SURE(nn.Module):
             )
         else:
             self.encoder_n = MLP(
-                [self.z_dim] + hidden_sizes + [self.code_size],
+                [self.latent_dim] + hidden_sizes + [self.code_size],
                 activation=activate_fct,
                 output_activation=None,
                 post_layer_fct=post_layer_fct,
@@ -252,7 +252,7 @@ class SURE(nn.Module):
             )
 
         self.encoder_zn = MLP(
-            [self.input_size] + hidden_sizes + [[z_dim, z_dim]],
+            [self.input_size] + hidden_sizes + [[latent_dim, latent_dim]],
             activation=activate_fct,
             output_activation=[None, Exp],
             post_layer_fct=post_layer_fct,
@@ -264,7 +264,7 @@ class SURE(nn.Module):
         if self.use_undesired:
             if self.loss_func in ['gaussian','lognormal']:
                 self.decoder_concentrate = MLP(
-                    [self.undesired_size + self.z_dim] + self.decoder_hidden_layers + [[self.input_size, self.input_size]],
+                    [self.undesired_size + self.latent_dim] + self.decoder_hidden_layers + [[self.input_size, self.input_size]],
                     activation=activate_fct,
                     output_activation=[None, Exp],
                     post_layer_fct=post_layer_fct,
@@ -274,7 +274,7 @@ class SURE(nn.Module):
                 )
             else:
                 self.decoder_concentrate = MLP(
-                    [self.undesired_size + self.z_dim] + self.decoder_hidden_layers + [self.input_size],
+                    [self.undesired_size + self.latent_dim] + self.decoder_hidden_layers + [self.input_size],
                     activation=activate_fct,
                     output_activation=None,
                     post_layer_fct=post_layer_fct,
@@ -284,7 +284,7 @@ class SURE(nn.Module):
                 )
 
             self.encoder_gate = MLP(
-                [self.undesired_size + self.z_dim] + hidden_sizes + [[self.input_size, 1]],
+                [self.undesired_size + self.latent_dim] + hidden_sizes + [[self.input_size, 1]],
                 activation=activate_fct,
                 output_activation=[None, Exp],
                 post_layer_fct=post_layer_fct,
@@ -295,7 +295,7 @@ class SURE(nn.Module):
         else:
             if self.loss_func in ['gaussian','lognormal']:
                 self.decoder_concentrate = MLP(
-                    [self.z_dim] + self.decoder_hidden_layers + [[self.input_size, self.input_size]],
+                    [self.latent_dim] + self.decoder_hidden_layers + [[self.input_size, self.input_size]],
                     activation=activate_fct,
                     output_activation=[None, Exp],
                     post_layer_fct=post_layer_fct,
@@ -305,7 +305,7 @@ class SURE(nn.Module):
                 )
             else:
                 self.decoder_concentrate = MLP(
-                    [self.z_dim] + self.decoder_hidden_layers + [self.input_size],
+                    [self.latent_dim] + self.decoder_hidden_layers + [self.input_size],
                     activation=activate_fct,
                     output_activation=None,
                     post_layer_fct=post_layer_fct,
@@ -315,7 +315,7 @@ class SURE(nn.Module):
                 )
 
             self.encoder_gate = MLP(
-                [self.z_dim] + hidden_sizes + [[self.input_size, 1]],
+                [self.latent_dim] + hidden_sizes + [[self.input_size, 1]],
                 activation=activate_fct,
                 output_activation=[None, Exp],
                 post_layer_fct=post_layer_fct,
@@ -326,7 +326,7 @@ class SURE(nn.Module):
 
         if self.latent_dist == 'studentt':
             self.codebook = MLP(
-                [self.code_size] + hidden_sizes + [[z_dim,z_dim,z_dim]],
+                [self.code_size] + hidden_sizes + [[latent_dim,latent_dim,latent_dim]],
                 activation=activate_fct,
                 output_activation=[Exp,None,Exp],
                 post_layer_fct=post_layer_fct,
@@ -336,7 +336,7 @@ class SURE(nn.Module):
             )
         else:
             self.codebook = MLP(
-                [self.code_size] + hidden_sizes + [[z_dim,z_dim]],
+                [self.code_size] + hidden_sizes + [[latent_dim,latent_dim]],
                 activation=activate_fct,
                 output_activation=[None,Exp],
                 post_layer_fct=post_layer_fct,
@@ -1714,7 +1714,7 @@ def main():
         input_size=input_size,
         undesired_size=undesired_size,
         inverse_dispersion=args.inverse_dispersion,
-        z_dim=args.z_dim,
+        latent_dim=args.latent_dim,
         hidden_layers=args.hidden_layers,
         hidden_layer_activation=args.hidden_layer_activation,
         use_cuda=args.cuda,
