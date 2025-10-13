@@ -20,6 +20,7 @@ import random
 import numpy as np
 import datatable as dt
 from tqdm import tqdm
+from scipy import sparse
 
 from typing import Literal
 
@@ -93,81 +94,50 @@ class SURE(nn.Module):
 
     """
     def __init__(self,
-                 input_size: int = 2000,
-                 undesired_size: int = 2,
+                 input_size: int,
                  codebook_size: int = 200,
+                 cell_factor_size: int = 0,
                  supervised_mode: bool = False,
-                 latent_dim: int = 10,
-                 latent_dist: Literal['normal','studentt','laplacian','cauchy','gumbel'] = 'normal',
+                 z_dim: int = 10,
+                 z_dist: Literal['normal','studentt','laplacian','cauchy','gumbel'] = 'normal',
+                 loss_func: Literal['negbinomial','poisson','multinomial'] = 'negbinomial',
+                 inverse_dispersion: float = 10.0,
+                 use_zeroinflate: bool = False,
                  hidden_layers: list = [500],
                  hidden_layer_activation: Literal['relu','softplus','leakyrelu','linear'] = 'relu',
-                 use_dirichlet: bool = True,
-                 dirichlet_mass: float = 1.0,
-                 loss_func: Literal['negbinomial','poisson','multinomial','gaussian'] = 'negbinomial',
-                 inverse_dispersion: float = 10.0,
                  nn_dropout: float = 0.1,
-                 zero_inflation: Literal['exact','inexact','none'] = 'exact',
-                 gate_prior: float = 0.6,
-                 delta: float = 0.0,
                  post_layer_fct: list = ['layernorm'],
                  post_act_fct: list = None,
                  config_enum: str = 'parallel',
                  use_cuda: bool = False,
+                 seed: int = 42,
                  dtype = torch.float32, # type: ignore
                  ):
         super().__init__()
 
         self.input_size = input_size
-        self.undesired_size = undesired_size
+        self.cell_factor_size = cell_factor_size
         self.inverse_dispersion = inverse_dispersion
-        self.latent_dim = latent_dim
+        self.latent_dim = z_dim
         self.hidden_layers = hidden_layers
         self.decoder_hidden_layers = hidden_layers[::-1]
-        self.use_undesired = True if self.undesired_size>0 else False
         self.allow_broadcast = config_enum == 'parallel'
         self.use_cuda = use_cuda
-        self.delta = delta
         self.loss_func = loss_func
-        self.dirimulti_mass = dirichlet_mass
         self.options = None
         self.code_size=codebook_size
         self.supervised_mode=supervised_mode
-
-        self.use_studentt = False
-        self.use_laplacian=False
-        self.latent_dist = latent_dist
-        if latent_dist.lower() in ['laplacian']:
-            self.use_laplacian=True
-        elif latent_dist.lower() in ['studentt','student-t','t']:
-            self.use_studentt = True 
+        self.latent_dist = z_dist
         self.dtype = dtype
-
-        self.dist_model = 'dmm' if use_dirichlet else 'mm'
-
-        self.use_zeroinflate=False
-        self.use_exact_zeroinflate=False
-        if zero_inflation=='exact':
-            self.use_exact_zeroinflate=True
-            self.use_zeroinflate=True
-        elif zero_inflation=='inexact':
-            self.use_zeroinflate=True
-
-        if self.loss_func.lower() in ['negbinom','nb','negb']:
-            self.loss_func = 'negbinomial'
-
-        if gate_prior < 1e-5:
-            gate_prior = 1e-5
-        elif gate_prior == 1:
-            gate_prior = 1-1e-5
-        self.gate_prior = np.log(gate_prior) - np.log(1-gate_prior)
-
+        self.use_zeroinflate=use_zeroinflate
         self.nn_dropout = nn_dropout
         self.post_layer_fct = post_layer_fct
         self.post_act_fct = post_act_fct
         self.hidden_layer_activation = hidden_layer_activation
-
+        
         self.codebook_weights = None
 
+        set_random_seed(seed)
         self.setup_networks()
 
     def setup_networks(self):
@@ -261,20 +231,9 @@ class SURE(nn.Module):
             use_cuda=self.use_cuda,
         )
 
-        if self.use_undesired:
-            if self.loss_func in ['gaussian','lognormal']:
-                self.decoder_concentrate = MLP(
-                    [self.undesired_size + self.latent_dim] + self.decoder_hidden_layers + [[self.input_size, self.input_size]],
-                    activation=activate_fct,
-                    output_activation=[None, Exp],
-                    post_layer_fct=post_layer_fct,
-                    post_act_fct=post_act_fct,
-                    allow_broadcast=self.allow_broadcast,
-                    use_cuda=self.use_cuda,
-                )
-            else:
-                self.decoder_concentrate = MLP(
-                    [self.undesired_size + self.latent_dim] + self.decoder_hidden_layers + [self.input_size],
+        if self.cell_factor_size>0:
+            self.cell_factor_effect = MLP(
+                    [self.cell_factor_size] + self.decoder_hidden_layers + [self.latent_dim],
                     activation=activate_fct,
                     output_activation=None,
                     post_layer_fct=post_layer_fct,
@@ -282,42 +241,11 @@ class SURE(nn.Module):
                     allow_broadcast=self.allow_broadcast,
                     use_cuda=self.use_cuda,
                 )
-
-            self.encoder_gate = MLP(
-                [self.undesired_size + self.latent_dim] + hidden_sizes + [[self.input_size, 1]],
+            
+        self.decoder_concentrate = MLP(
+                [self.latent_dim] + self.decoder_hidden_layers + [self.input_size],
                 activation=activate_fct,
-                output_activation=[None, Exp],
-                post_layer_fct=post_layer_fct,
-                post_act_fct=post_act_fct,
-                allow_broadcast=self.allow_broadcast,
-                use_cuda=self.use_cuda,
-            )
-        else:
-            if self.loss_func in ['gaussian','lognormal']:
-                self.decoder_concentrate = MLP(
-                    [self.latent_dim] + self.decoder_hidden_layers + [[self.input_size, self.input_size]],
-                    activation=activate_fct,
-                    output_activation=[None, Exp],
-                    post_layer_fct=post_layer_fct,
-                    post_act_fct=post_act_fct,
-                    allow_broadcast=self.allow_broadcast,
-                    use_cuda=self.use_cuda,
-                )
-            else:
-                self.decoder_concentrate = MLP(
-                    [self.latent_dim] + self.decoder_hidden_layers + [self.input_size],
-                    activation=activate_fct,
-                    output_activation=None,
-                    post_layer_fct=post_layer_fct,
-                    post_act_fct=post_act_fct,
-                    allow_broadcast=self.allow_broadcast,
-                    use_cuda=self.use_cuda,
-                )
-
-            self.encoder_gate = MLP(
-                [self.latent_dim] + hidden_sizes + [[self.input_size, 1]],
-                activation=activate_fct,
-                output_activation=[None, Exp],
+                output_activation=None,
                 post_layer_fct=post_layer_fct,
                 post_act_fct=post_act_fct,
                 allow_broadcast=self.allow_broadcast,
@@ -326,9 +254,9 @@ class SURE(nn.Module):
 
         if self.latent_dist == 'studentt':
             self.codebook = MLP(
-                [self.code_size] + hidden_sizes + [[latent_dim,latent_dim,latent_dim]],
+                [self.code_size] + hidden_sizes + [[latent_dim,latent_dim]],
                 activation=activate_fct,
-                output_activation=[Exp,None,Exp],
+                output_activation=[Exp,None],
                 post_layer_fct=post_layer_fct,
                 post_act_fct=post_act_fct,
                 allow_broadcast=self.allow_broadcast,
@@ -336,9 +264,9 @@ class SURE(nn.Module):
             )
         else:
             self.codebook = MLP(
-                [self.code_size] + hidden_sizes + [[latent_dim,latent_dim]],
+                [self.code_size] + hidden_sizes + [latent_dim],
                 activation=activate_fct,
-                output_activation=[None,Exp],
+                output_activation=None,
                 post_layer_fct=post_layer_fct,
                 post_act_fct=post_act_fct,
                 allow_broadcast=self.allow_broadcast,
@@ -366,13 +294,15 @@ class SURE(nn.Module):
         return xs
 
     def softmax(self, xs):
-        xs = SoftmaxTransform()(xs)
+        #xs = SoftmaxTransform()(xs)
+        xs = dist.Multinomial(total_count=1, logits=xs).mean
         return xs
     
     def sigmoid(self, xs):
-        sigm_enc = nn.Sigmoid()
-        xs = sigm_enc(xs)
-        xs = clamp_probs(xs)
+        #sigm_enc = nn.Sigmoid()
+        #xs = sigm_enc(xs)
+        #xs = clamp_probs(xs)
+        xs = dist.Bernoulli(logits=xs).mean
         return xs
 
     def softmax_logit(self, xs):
@@ -397,96 +327,63 @@ class SURE(nn.Module):
     def model1(self, xs):
         pyro.module('sure', self)
 
-        total_count = pyro.param("inverse_dispersion", self.inverse_dispersion *
-                                 xs.new_ones(self.input_size), constraint=constraints.positive)
-        
         eps = torch.finfo(xs.dtype).eps
         batch_size = xs.size(0)
         self.options = dict(dtype=xs.dtype, device=xs.device)
+        
+        if self.loss_func=='negbinomial':
+            total_count = pyro.param("inverse_dispersion", self.inverse_dispersion *
+                                     xs.new_ones(self.input_size), constraint=constraints.positive)
+            
+        if self.use_zeroinflate:
+            gate_logits = pyro.param("dropout_rate", xs.new_zeros(self.input_size))
+            
+        acs_scale = pyro.param("codebook_scale", xs.new_ones(self.latent_dim), constraint=constraints.positive)
 
         I = torch.eye(self.code_size)
         if self.latent_dist=='studentt':
-            acs_dof,acs_loc,acs_scale = self.codebook(I)
+            acs_dof,acs_loc = self.codebook(I)
         else:
-            acs_loc,acs_scale = self.codebook(I)
+            acs_loc = self.codebook(I)
 
         with pyro.plate('data'):
             prior = torch.zeros(batch_size, self.code_size, **self.options)
             ns = pyro.sample('n', dist.OneHotCategorical(logits=prior))
 
-            prior_loc = torch.matmul(ns,acs_loc)
-            prior_scale = torch.matmul(ns,acs_scale)
+            zn_loc = torch.matmul(ns,acs_loc)
+            #zn_scale = torch.matmul(ns,acs_scale)
+            zn_scale = acs_scale
 
             if self.latent_dist == 'studentt':
                 prior_dof = torch.matmul(ns,acs_dof)
-                zns = pyro.sample('zn', dist.StudentT(df=prior_dof, loc=prior_loc, scale=prior_scale).to_event(1))
+                zns = pyro.sample('zn', dist.StudentT(df=prior_dof, loc=zn_loc, scale=zn_scale).to_event(1))
             elif self.latent_dist == 'laplacian':
-                zns = pyro.sample('zn', dist.Laplace(prior_loc, prior_scale).to_event(1))
+                zns = pyro.sample('zn', dist.Laplace(zn_loc, zn_scale).to_event(1))
             elif self.latent_dist == 'cauchy':
-                zns = pyro.sample('zn', dist.Cauchy(prior_loc, prior_scale).to_event(1))
+                zns = pyro.sample('zn', dist.Cauchy(zn_loc, zn_scale).to_event(1))
             elif self.latent_dist == 'normal':
-                zns = pyro.sample('zn', dist.Normal(prior_loc, prior_scale).to_event(1))
+                zns = pyro.sample('zn', dist.Normal(zn_loc, zn_scale).to_event(1))
+            elif self.latent_dist == 'gumbel':
+                zns = pyro.sample('zn', dist.Gumbel(zn_loc, zn_scale).to_event(1))
 
             zs = zns
-
-            if self.loss_func == 'gaussian':
-                concentrate_loc, concentrate_scale = self.decoder_concentrate(zs)
-                concentrate = concentrate_loc
-            else:
-                concentrate = self.decoder_concentrate(zs)
-
-            if self.dist_model == 'dmm':
-                concentrate = self.dirimulti_param(concentrate)
-                theta = dist.DirichletMultinomial(total_count=1, concentration=concentrate).mean
-            elif self.dist_model == 'mm':
-                probs = self.multi_param(concentrate)
-                theta = dist.Multinomial(total_count=1, probs=probs).mean
-
-            if self.use_zeroinflate:
-                gate_loc = self.gate_prior * torch.ones(batch_size, self.input_size, **self.options)
-                gate_scale = torch.ones(batch_size, self.input_size, **self.options)
-                gate_logits = pyro.sample('gate_logit', dist.Normal(gate_loc, gate_scale).to_event(1))
-                gate_probs = self.sigmoid(gate_logits)
-
-                if self.use_exact_zeroinflate:
-                    if self.loss_func == 'multinomial':
-                        theta = probs_to_logits(theta) + probs_to_logits(1-gate_probs)
-                        theta = logits_to_probs(theta)
-                else:
-                    if self.loss_func != 'gaussian':
-                        theta = probs_to_logits(theta) + probs_to_logits(1-gate_probs)
-                        theta = logits_to_probs(theta)
-
-                if self.delta > 0:
-                    ones = torch.zeros(batch_size, self.input_size, **self.options)
-                    ones[xs > 0] = 1
-                    with pyro.poutine.scale(scale=self.delta):
-                        ones = pyro.sample('one', dist.Binomial(probs=1-gate_probs).to_event(1), obs=ones)
+            concentrate = self.decoder_concentrate(zs)
+            rate = concentrate.exp()
+            if self.loss_func != 'poisson':
+                theta = dist.DirichletMultinomial(total_count=1, concentration=rate).mean
 
             if self.loss_func == 'negbinomial':
-                theta = self.cutoff(theta, thresh=eps)
                 if self.use_exact_zeroinflate:
                     pyro.sample('x', dist.ZeroInflatedDistribution(dist.NegativeBinomial(total_count=total_count, probs=theta),gate_logits=gate_logits).to_event(1), obs=xs)
                 else:
                     pyro.sample('x', dist.NegativeBinomial(total_count=total_count, probs=theta).to_event(1), obs=xs)
             elif self.loss_func == 'poisson':
-                rate = xs.sum(1).unsqueeze(-1) * theta
                 if self.use_exact_zeroinflate:
                     pyro.sample('x', dist.ZeroInflatedDistribution(dist.Poisson(rate=rate),gate_logits=gate_logits).to_event(1), obs=xs.round())
                 else:
                     pyro.sample('x', dist.Poisson(rate=rate).to_event(1), obs=xs.round())
             elif self.loss_func == 'multinomial':
                 pyro.sample('x', dist.Multinomial(total_count=int(1e8), probs=theta), obs=xs)
-            elif self.loss_func == 'gaussian':
-                if self.use_zeroinflate:
-                    pyro.sample('x', dist.ZeroInflatedDistribution(dist.Normal(concentrate_loc, concentrate_scale),gate_logits=gate_logits).to_event(1), obs=xs)
-                else:
-                    pyro.sample('x', dist.Normal(concentrate_loc, concentrate_scale).to_event(1), obs=xs)
-            elif self.loss_func == 'lognormal':
-                if self.use_zeroinflate:
-                    pyro.sample('x', dist.ZeroInflatedDistribution(dist.LogNormal(concentrate_loc, concentrate_scale),gate_logits=gate_logits).to_event(1), obs=xs)
-                else:
-                    pyro.sample('x', dist.LogNormal(concentrate_loc, concentrate_scale).to_event(1), obs=xs)
 
     def guide1(self, xs):
         with pyro.plate('data'):
@@ -495,84 +392,59 @@ class SURE(nn.Module):
 
             alpha = self.encoder_n(zns)
             ns = pyro.sample('n', dist.OneHotCategorical(logits=alpha))
-            
-            if self.use_zeroinflate:
-                zs=zns
-                loc, scale = self.encoder_gate(zs)
-                scale = self.cutoff(scale)
-                gates_logit = pyro.sample('gate_logit', dist.Normal(loc, scale).to_event(1))
 
     def model2(self, xs, us=None):
         pyro.module('sure', self)
 
-        total_count = pyro.param("inverse_dispersion", self.inverse_dispersion *
-                                 xs.new_ones(self.input_size), constraint=constraints.positive)
-        
         eps = torch.finfo(xs.dtype).eps
         batch_size = xs.size(0)
         self.options = dict(dtype=xs.dtype, device=xs.device)
+        
+        if self.loss_func=='negbinomial':
+            total_count = pyro.param("inverse_dispersion", self.inverse_dispersion *
+                                     xs.new_ones(self.input_size), constraint=constraints.positive)
+            
+        if self.use_zeroinflate:
+            gate_logits = pyro.param("dropout_rate", xs.new_zeros(self.input_size))
+            
+        acs_scale = pyro.param("codebook_scale", xs.new_ones(self.latent_dim), constraint=constraints.positive)
 
         I = torch.eye(self.code_size)
-        if self.latent_dist == 'studentt':
-            acs_dof,acs_loc,acs_scale = self.codebook(I)
+        if self.latent_dist=='studentt':
+            acs_dof,acs_loc = self.codebook(I)
         else:
-            acs_loc,acs_scale = self.codebook(I)
+            acs_loc = self.codebook(I)
 
         with pyro.plate('data'):
             prior = torch.zeros(batch_size, self.code_size, **self.options)
             ns = pyro.sample('n', dist.OneHotCategorical(logits=prior))
 
-            prior_loc = torch.matmul(ns,acs_loc)
-            prior_scale = torch.matmul(ns,acs_scale)
+            zn_loc = torch.matmul(ns,acs_loc)
+            #zn_scale = torch.matmul(ns,acs_scale)
+            zn_scale = acs_scale
 
             if self.latent_dist == 'studentt':
                 prior_dof = torch.matmul(ns,acs_dof)
-                zns = pyro.sample('zn', dist.StudentT(df=prior_dof, loc=prior_loc, scale=prior_scale).to_event(1))
+                zns = pyro.sample('zn', dist.StudentT(df=prior_dof, loc=zn_loc, scale=zn_scale).to_event(1))
             elif self.latent_dist == 'laplacian':
-                zns = pyro.sample('zn', dist.Laplace(prior_loc, prior_scale).to_event(1))
+                zns = pyro.sample('zn', dist.Laplace(zn_loc, zn_scale).to_event(1))
             elif self.latent_dist == 'cauchy':
-                zns = pyro.sample('zn', dist.Cauchy(prior_loc, prior_scale).to_event(1))
+                zns = pyro.sample('zn', dist.Cauchy(zn_loc, zn_scale).to_event(1))
             elif self.latent_dist == 'normal':
-                zns = pyro.sample('zn', dist.Normal(prior_loc, prior_scale).to_event(1))
+                zns = pyro.sample('zn', dist.Normal(zn_loc, zn_scale).to_event(1))
+            elif self.latent_dist == 'gumbel':
+                zns = pyro.sample('zn', dist.Gumbel(zn_loc, zn_scale).to_event(1))
 
-            if self.use_undesired:
-                zs = [us, zns]
+            if self.cell_factor_size>0:
+                zus = self.cell_factor_effect(us)
+                zs = zns + zus
             else:
                 zs = zns
 
-            if self.loss_func == 'gaussian':
-                concentrate_loc, concentrate_scale = self.decoder_concentrate(zs)
-                concentrate = concentrate_loc
-            else:
-                concentrate = self.decoder_concentrate(zs)
-
-            if self.dist_model == 'dmm':
-                concentrate = self.dirimulti_param(concentrate)
-                theta = dist.DirichletMultinomial(total_count=1, concentration=concentrate).mean
-            elif self.dist_model == 'mm':
-                probs = self.multi_param(concentrate)
-                theta = dist.Multinomial(total_count=1, probs=probs).mean
-
-            if self.use_zeroinflate:
-                gate_loc = self.gate_prior * torch.ones(batch_size, self.input_size, **self.options)
-                gate_scale = torch.ones(batch_size, self.input_size, **self.options)
-                gate_logits = pyro.sample('gate_logit', dist.Normal(gate_loc, gate_scale).to_event(1))
-                gate_probs = self.sigmoid(gate_logits)
-
-                if self.use_exact_zeroinflate:
-                    if self.loss_func == 'multinomial':
-                        theta = probs_to_logits(theta) + probs_to_logits(1-gate_probs)
-                        theta = logits_to_probs(theta)
-                else:
-                    if self.loss_func != 'gaussian':
-                        theta = probs_to_logits(theta) + probs_to_logits(1-gate_probs)
-                        theta = logits_to_probs(theta)
-
-                if self.delta > 0:
-                    ones = torch.zeros(batch_size, self.input_size, **self.options)
-                    ones[xs > 0] = 1
-                    with pyro.poutine.scale(scale=self.delta):
-                        ones = pyro.sample('one', dist.Binomial(probs=1-gate_probs).to_event(1), obs=ones)
+            concentrate = self.decoder_concentrate(zs)
+            rate = concentrate.exp()
+            if self.loss_func != 'poisson':
+                theta = dist.DirichletMultinomial(total_count=1, concentration=rate).mean
 
             if self.loss_func == 'negbinomial':
                 if self.use_exact_zeroinflate:
@@ -580,23 +452,12 @@ class SURE(nn.Module):
                 else:
                     pyro.sample('x', dist.NegativeBinomial(total_count=total_count, probs=theta).to_event(1), obs=xs)
             elif self.loss_func == 'poisson':
-                rate = xs.sum(1).unsqueeze(-1) * theta
                 if self.use_exact_zeroinflate:
                     pyro.sample('x', dist.ZeroInflatedDistribution(dist.Poisson(rate=rate),gate_logits=gate_logits).to_event(1), obs=xs.round())
                 else:
                     pyro.sample('x', dist.Poisson(rate=rate).to_event(1), obs=xs.round())
             elif self.loss_func == 'multinomial':
                 pyro.sample('x', dist.Multinomial(total_count=int(1e8), probs=theta), obs=xs)
-            elif self.loss_func == 'gaussian':
-                if self.use_zeroinflate:
-                    pyro.sample('x', dist.ZeroInflatedDistribution(dist.Normal(concentrate_loc, concentrate_scale),gate_logits=gate_logits).to_event(1), obs=xs)
-                else:
-                    pyro.sample('x', dist.Normal(concentrate_loc, concentrate_scale).to_event(1), obs=xs)
-            elif self.loss_func == 'lognormal':
-                if self.use_zeroinflate:
-                    pyro.sample('x', dist.ZeroInflatedDistribution(dist.LogNormal(concentrate_loc, concentrate_scale),gate_logits=gate_logits).to_event(1), obs=xs)
-                else:
-                    pyro.sample('x', dist.LogNormal(concentrate_loc, concentrate_scale).to_event(1), obs=xs)
 
     def guide2(self, xs, us=None):
         with pyro.plate('data'):
@@ -605,97 +466,71 @@ class SURE(nn.Module):
 
             alpha = self.encoder_n(zns)
             ns = pyro.sample('n', dist.OneHotCategorical(logits=alpha))
-            
-            if self.use_zeroinflate:
-                if self.use_undesired:
-                    zs=[us,zns]
-                else:
-                    zs=zns
-                loc, scale = self.encoder_gate(zs)
-                scale = self.cutoff(scale)
-                gates_logit = pyro.sample('gate_logit', dist.Normal(loc, scale).to_event(1))
 
     def model3(self, xs, ys, embeds=None):
         pyro.module('sure', self)
 
-        total_count = pyro.param("inverse_dispersion", self.inverse_dispersion *
-                                 xs.new_ones(self.input_size), constraint=constraints.positive)
-        
         eps = torch.finfo(xs.dtype).eps
         batch_size = xs.size(0)
         self.options = dict(dtype=xs.dtype, device=xs.device)
+        
+        if self.loss_func=='negbinomial':
+            total_count = pyro.param("inverse_dispersion", self.inverse_dispersion *
+                                     xs.new_ones(self.input_size), constraint=constraints.positive)
+            
+        if self.use_zeroinflate:
+            gate_logits = pyro.param("dropout_rate", xs.new_zeros(self.input_size))
+            
+        acs_scale = pyro.param("codebook_scale", xs.new_ones(self.latent_dim), constraint=constraints.positive)
 
         I = torch.eye(self.code_size)
-        if self.latent_dist == 'studentt':
-            acs_dof,acs_loc,acs_scale = self.codebook(I)
+        if self.latent_dist=='studentt':
+            acs_dof,acs_loc = self.codebook(I)
         else:
-            acs_loc,acs_scale = self.codebook(I)
+            acs_loc = self.codebook(I)
 
         with pyro.plate('data'):
             #prior = torch.zeros(batch_size, self.code_size, **self.options)
             prior = self.encoder_n(xs)
             ns = pyro.sample('n', dist.OneHotCategorical(logits=prior), obs=ys)
 
-            prior_loc = torch.matmul(ns,acs_loc)
-            prior_scale = torch.matmul(ns,acs_scale)
+            zn_loc = torch.matmul(ns,acs_loc)
+            #prior_scale = torch.matmul(ns,acs_scale)
+            zn_scale = acs_scale
 
             if self.latent_dist=='studentt':
                 prior_dof = torch.matmul(ns,acs_dof)
                 if embeds is None:
-                    zns = pyro.sample('zn', dist.StudentT(df=prior_dof, loc=prior_loc, scale=prior_scale).to_event(1))
+                    zns = pyro.sample('zn', dist.StudentT(df=prior_dof, loc=zn_loc, scale=zn_scale).to_event(1))
                 else:
-                    zns = pyro.sample('zn', dist.StudentT(df=prior_dof, loc=prior_loc, scale=prior_scale).to_event(1), obs=embeds)
+                    zns = pyro.sample('zn', dist.StudentT(df=prior_dof, loc=zn_loc, scale=zn_scale).to_event(1), obs=embeds)
             elif self.latent_dist=='laplacian':
                 if embeds is None:
-                    zns = pyro.sample('zn', dist.Laplace(prior_loc, prior_scale).to_event(1))
+                    zns = pyro.sample('zn', dist.Laplace(zn_loc, zn_scale).to_event(1))
                 else:
-                    zns = pyro.sample('zn', dist.Laplace(prior_loc, prior_scale).to_event(1), obs=embeds)
+                    zns = pyro.sample('zn', dist.Laplace(zn_loc, zn_scale).to_event(1), obs=embeds)
             elif self.latent_dist=='cauchy':
                 if embeds is None:
-                    zns = pyro.sample('zn', dist.Cauchy(prior_loc, prior_scale).to_event(1))
+                    zns = pyro.sample('zn', dist.Cauchy(zn_loc, zn_scale).to_event(1))
                 else:
-                    zns = pyro.sample('zn', dist.Cauchy(prior_loc, prior_scale).to_event(1), obs=embeds)
+                    zns = pyro.sample('zn', dist.Cauchy(zn_loc, zn_scale).to_event(1), obs=embeds)
             elif self.latent_dist=='normal':
                 if embeds is None:
-                    zns = pyro.sample('zn', dist.Normal(prior_loc, prior_scale).to_event(1))
+                    zns = pyro.sample('zn', dist.Normal(zn_loc, zn_scale).to_event(1))
                 else:
-                    zns = pyro.sample('zn', dist.Normal(prior_loc, prior_scale).to_event(1), obs=embeds)
+                    zns = pyro.sample('zn', dist.Normal(zn_loc, zn_scale).to_event(1), obs=embeds)
+            elif self.z_dist == 'gumbel':
+                if embeds is None:
+                    zns = pyro.sample('zn', dist.Gumbel(zn_loc, zn_scale).to_event(1))
+                else:
+                    zns = pyro.sample('zn', dist.Gumbel(zn_loc, zn_scale).to_event(1), obs=embeds)
 
             zs = zns
 
-            if self.loss_func == 'gaussian':
-                concentrate_loc, concentrate_scale = self.decoder_concentrate(zs)
-                concentrate = concentrate_loc
-            else:
-                concentrate = self.decoder_concentrate(zs)
-
-            if self.dist_model == 'dmm':
-                concentrate = self.dirimulti_param(concentrate)
-                theta = dist.DirichletMultinomial(total_count=1, concentration=concentrate).mean
-            elif self.dist_model == 'mm':
-                probs = self.multi_param(concentrate)
-                theta = dist.Multinomial(total_count=1, probs=probs).mean
-
-            if self.use_zeroinflate:
-                gate_loc = self.gate_prior * torch.ones(batch_size, self.input_size, **self.options)
-                gate_scale = torch.ones(batch_size, self.input_size, **self.options)
-                gate_logits = pyro.sample('gate_logit', dist.Normal(gate_loc, gate_scale).to_event(1))
-                gate_probs = self.sigmoid(gate_logits)
-
-                if self.use_exact_zeroinflate:
-                    if self.loss_func == 'multinomial':
-                        theta = probs_to_logits(theta) + probs_to_logits(1-gate_probs)
-                        theta = logits_to_probs(theta)
-                else:
-                    if self.loss_func != 'gaussian':
-                        theta = probs_to_logits(theta) + probs_to_logits(1-gate_probs)
-                        theta = logits_to_probs(theta)
-
-                if self.delta > 0:
-                    ones = torch.zeros(batch_size, self.input_size, **self.options)
-                    ones[xs > 0] = 1
-                    with pyro.poutine.scale(scale=self.delta):
-                        ones = pyro.sample('one', dist.Binomial(probs=1-gate_probs).to_event(1), obs=ones)
+            concentrate = self.decoder_concentrate(zs)
+            rate = concentrate.exp()
+            if self.loss_func != 'poisson':
+                theta = dist.DirichletMultinomial(total_count=1, concentration=rate).mean
 
             if self.loss_func == 'negbinomial':
                 if self.use_exact_zeroinflate:
@@ -703,122 +538,87 @@ class SURE(nn.Module):
                 else:
                     pyro.sample('x', dist.NegativeBinomial(total_count=total_count, probs=theta).to_event(1), obs=xs)
             elif self.loss_func == 'poisson':
-                rate = xs.sum(1).unsqueeze(-1) * theta
                 if self.use_exact_zeroinflate:
                     pyro.sample('x', dist.ZeroInflatedDistribution(dist.Poisson(rate=rate),gate_logits=gate_logits).to_event(1), obs=xs.round())
                 else:
                     pyro.sample('x', dist.Poisson(rate=rate).to_event(1), obs=xs.round())
             elif self.loss_func == 'multinomial':
                 pyro.sample('x', dist.Multinomial(total_count=int(1e8), probs=theta), obs=xs)
-            elif self.loss_func == 'gaussian':
-                if self.use_zeroinflate:
-                    pyro.sample('x', dist.ZeroInflatedDistribution(dist.Normal(concentrate_loc, concentrate_scale),gate_logits=gate_logits).to_event(1), obs=xs)
-                else:
-                    pyro.sample('x', dist.Normal(concentrate_loc, concentrate_scale).to_event(1), obs=xs)
-            elif self.loss_func == 'lognormal':
-                if self.use_zeroinflate:
-                    pyro.sample('x', dist.ZeroInflatedDistribution(dist.LogNormal(concentrate_loc, concentrate_scale),gate_logits=gate_logits).to_event(1), obs=xs)
-                else:
-                    pyro.sample('x', dist.LogNormal(concentrate_loc, concentrate_scale).to_event(1), obs=xs)
 
     def guide3(self, xs, ys, embeds=None):
         with pyro.plate('data'):
             if embeds is None:
                 zn_loc, zn_scale = self.encoder_zn(xs)
                 zns = pyro.sample('zn', dist.Normal(zn_loc, zn_scale).to_event(1))
-            else:
-                zns = embeds
-
-            #alpha = self.encoder_n(zns)
-            #ns = pyro.sample('n', dist.OneHotCategorical(logits=alpha))
-            
-            if self.use_zeroinflate:
-                zs=zns
-                loc, scale = self.encoder_gate(zs)
-                scale = self.cutoff(scale)
-                gates_logit = pyro.sample('gate_logit', dist.Normal(loc, scale).to_event(1))
 
     def model4(self, xs, us, ys, embeds=None):
         pyro.module('sure', self)
 
-        total_count = pyro.param("inverse_dispersion", self.inverse_dispersion *
-                                 xs.new_ones(self.input_size), constraint=constraints.positive)
-        
         eps = torch.finfo(xs.dtype).eps
         batch_size = xs.size(0)
         self.options = dict(dtype=xs.dtype, device=xs.device)
+        
+        if self.loss_func=='negbinomial':
+            total_count = pyro.param("inverse_dispersion", self.inverse_dispersion *
+                                     xs.new_ones(self.input_size), constraint=constraints.positive)
+            
+        if self.use_zeroinflate:
+            gate_logits = pyro.param("dropout_rate", xs.new_zeros(self.input_size))
+            
+        acs_scale = pyro.param("codebook_scale", xs.new_ones(self.latent_dim), constraint=constraints.positive)
 
         I = torch.eye(self.code_size)
-        if self.latent_dist == 'studentt':
-            acs_dof,acs_loc,acs_scale = self.codebook(I)
+        if self.latent_dist=='studentt':
+            acs_dof,acs_loc = self.codebook(I)
         else:
-            acs_loc,acs_scale = self.codebook(I)
+            acs_loc = self.codebook(I)
 
         with pyro.plate('data'):
             #prior = torch.zeros(batch_size, self.code_size, **self.options)
             prior = self.encoder_n(xs)
             ns = pyro.sample('n', dist.OneHotCategorical(logits=prior), obs=ys)
 
-            prior_loc = torch.matmul(ns,acs_loc)
-            prior_scale = torch.matmul(ns,acs_scale)
+            zn_loc = torch.matmul(ns,acs_loc)
+            #prior_scale = torch.matmul(ns,acs_scale)
+            zn_scale = acs_scale
 
             if self.latent_dist=='studentt':
                 prior_dof = torch.matmul(ns,acs_dof)
                 if embeds is None:
-                    zns = pyro.sample('zn', dist.StudentT(df=prior_dof, loc=prior_loc, scale=prior_scale).to_event(1))
+                    zns = pyro.sample('zn', dist.StudentT(df=prior_dof, loc=zn_loc, scale=zn_scale).to_event(1))
                 else:
-                    zns = pyro.sample('zn', dist.StudentT(df=prior_dof, loc=prior_loc, scale=prior_scale).to_event(1), obs=embeds)
+                    zns = pyro.sample('zn', dist.StudentT(df=prior_dof, loc=zn_loc, scale=zn_scale).to_event(1), obs=embeds)
             elif self.latent_dist=='laplacian':
                 if embeds is None:
-                    zns = pyro.sample('zn', dist.Laplace(prior_loc, prior_scale).to_event(1))
+                    zns = pyro.sample('zn', dist.Laplace(zn_loc, zn_scale).to_event(1))
                 else:
-                    zns = pyro.sample('zn', dist.Laplace(prior_loc, prior_scale).to_event(1), obs=embeds)
+                    zns = pyro.sample('zn', dist.Laplace(zn_loc, zn_scale).to_event(1), obs=embeds)
             elif self.latent_dist=='cauchy':
                 if embeds is None:
-                    zns = pyro.sample('zn', dist.Cauchy(prior_loc, prior_scale).to_event(1))
+                    zns = pyro.sample('zn', dist.Cauchy(zn_loc, zn_scale).to_event(1))
                 else:
-                    zns = pyro.sample('zn', dist.Cauchy(prior_loc, prior_scale).to_event(1), obs=embeds)
+                    zns = pyro.sample('zn', dist.Cauchy(zn_loc, zn_scale).to_event(1), obs=embeds)
             elif self.latent_dist=='normal':
                 if embeds is None:
-                    zns = pyro.sample('zn', dist.Normal(prior_loc, prior_scale).to_event(1))
+                    zns = pyro.sample('zn', dist.Normal(zn_loc, zn_scale).to_event(1))
                 else:
-                    zns = pyro.sample('zn', dist.Normal(prior_loc, prior_scale).to_event(1), obs=embeds)
+                    zns = pyro.sample('zn', dist.Normal(zn_loc, zn_scale).to_event(1), obs=embeds)
+            elif self.z_dist == 'gumbel':
+                if embeds is None:
+                    zns = pyro.sample('zn', dist.Gumbel(zn_loc, zn_scale).to_event(1))
+                else:
+                    zns = pyro.sample('zn', dist.Gumbel(zn_loc, zn_scale).to_event(1), obs=embeds)
 
-            zs = [us, zns]
-
-            if self.loss_func == 'gaussian':
-                concentrate_loc, concentrate_scale = self.decoder_concentrate(zs)
-                concentrate = concentrate_loc
+            if self.cell_factor_size>0:
+                zus = self.cell_factor_effect(us)
+                zs = zus + zns
             else:
-                concentrate = self.decoder_concentrate(zs)
+                zs = zns
 
-            if self.dist_model == 'dmm':
-                concentrate = self.dirimulti_param(concentrate)
-                theta = dist.DirichletMultinomial(total_count=1, concentration=concentrate).mean
-            elif self.dist_model == 'mm':
-                probs = self.multi_param(concentrate)
-                theta = dist.Multinomial(total_count=1, probs=probs).mean
-
-            if self.use_zeroinflate:
-                gate_loc = self.gate_prior * torch.ones(batch_size, self.input_size, **self.options)
-                gate_scale = torch.ones(batch_size, self.input_size, **self.options)
-                gate_logits = pyro.sample('gate_logit', dist.Normal(gate_loc, gate_scale).to_event(1))
-                gate_probs = self.sigmoid(gate_logits)
-
-                if self.use_exact_zeroinflate:
-                    if self.loss_func == 'multinomial':
-                        theta = probs_to_logits(theta) + probs_to_logits(1-gate_probs)
-                        theta = logits_to_probs(theta)
-                else:
-                    if self.loss_func != 'gaussian':
-                        theta = probs_to_logits(theta) + probs_to_logits(1-gate_probs)
-                        theta = logits_to_probs(theta)
-
-                if self.delta > 0:
-                    ones = torch.zeros(batch_size, self.input_size, **self.options)
-                    ones[xs > 0] = 1
-                    with pyro.poutine.scale(scale=self.delta):
-                        ones = pyro.sample('one', dist.Binomial(probs=1-gate_probs).to_event(1), obs=ones)
+            concentrate = self.decoder_concentrate(zs)
+            rate = concentrate.exp()
+            if self.loss_func != 'poisson':
+                theta = dist.DirichletMultinomial(total_count=1, concentration=rate).mean
 
             if self.loss_func == 'negbinomial':
                 if self.use_exact_zeroinflate:
@@ -826,106 +626,42 @@ class SURE(nn.Module):
                 else:
                     pyro.sample('x', dist.NegativeBinomial(total_count=total_count, probs=theta).to_event(1), obs=xs)
             elif self.loss_func == 'poisson':
-                rate = xs.sum(1).unsqueeze(-1) * theta
                 if self.use_exact_zeroinflate:
                     pyro.sample('x', dist.ZeroInflatedDistribution(dist.Poisson(rate=rate),gate_logits=gate_logits).to_event(1), obs=xs.round())
                 else:
                     pyro.sample('x', dist.Poisson(rate=rate).to_event(1), obs=xs.round())
             elif self.loss_func == 'multinomial':
                 pyro.sample('x', dist.Multinomial(total_count=int(1e8), probs=theta), obs=xs)
-            elif self.loss_func == 'gaussian':
-                if self.use_zeroinflate:
-                    pyro.sample('x', dist.ZeroInflatedDistribution(dist.Normal(concentrate_loc, concentrate_scale),gate_logits=gate_logits).to_event(1), obs=xs)
-                else:
-                    pyro.sample('x', dist.Normal(concentrate_loc, concentrate_scale).to_event(1), obs=xs)
-            elif self.loss_func == 'lognormal':
-                if self.use_zeroinflate:
-                    pyro.sample('x', dist.ZeroInflatedDistribution(dist.LogNormal(concentrate_loc, concentrate_scale),gate_logits=gate_logits).to_event(1), obs=xs)
-                else:
-                    pyro.sample('x', dist.LogNormal(concentrate_loc, concentrate_scale).to_event(1), obs=xs)
 
     def guide4(self, xs, us, ys, embeds=None):
         with pyro.plate('data'):
             if embeds is None:
                 zn_loc, zn_scale = self.encoder_zn(xs)
                 zns = pyro.sample('zn', dist.Normal(zn_loc, zn_scale).to_event(1))
-            else:
-                zns = embeds
 
-            #alpha = self.encoder_n(zns)
-            #ns = pyro.sample('n', dist.OneHotCategorical(logits=alpha))
-            
-            if self.use_zeroinflate:
-                zs=[us,zns]
-                loc, scale = self.encoder_gate(zs)
-                scale = self.cutoff(scale)
-                gates_logit = pyro.sample('gate_logit', dist.Normal(loc, scale).to_event(1))
-
-    def _get_metacell_coordinates(self):
+    def _get_codebook(self):
         I = torch.eye(self.code_size, **self.options)
         if self.latent_dist=='studentt':
-            _,cb,_ = self.codebook(I)
+            _,cb = self.codebook(I)
         else:
-            cb,_ = self.codebook(I)
+            cb = self.codebook(I)
         return cb
     
-    def get_metacell_coordinates(self):
+    def get_codebook(self):
         """
         Return the mean part of metacell codebook
         """
         cb = self._get_metacell_coordinates()
         cb = tensor_to_numpy(cb)
         return cb
-    
-    def _get_metacell_expressions(self):
-        cbs = self._get_metacell_coordinates()
-        concentrate = self._expression(cbs)
-        return concentrate
-    
-    def get_metacell_expressions(self):
-        """
-        Return the scaled expression data of metacells
-        """
-        concentrate = self._get_metacell_expressions()
-        concentrate = tensor_to_numpy(concentrate)
-        return concentrate
-    
-    def get_metacell_counts(self, total_count=1e3, total_counts_per_item=1e6, use_sampler=False, sample_method='nb'):
-        """
-        Return the simulated count data of metacells
-        """
-        concentrate = self._get_metacell_expressions()
-        if use_sampler:
-            if sample_method.lower() == 'nb':
-                counts = self._count_sample(concentrate, total_count=total_count)
-            elif sample_method.lower() == 'poisson':
-                counts = self._count_sample_poisson(concentrate, total_counts_per_item=total_counts_per_item)
-        else:
-            counts = self._count(concentrate, total_counts_per_cell=total_counts_per_item)
-        counts = tensor_to_numpy(counts)
-        return counts
 
-    def _get_cell_coordinates(self, xs, use_decoder=False, soft_assign=False):
-        if self.supervised_mode:
-            use_decoder=True 
-            soft_assign=True 
-            
-        if use_decoder:
-            cb = self._get_metacell_coordinates()
-            if soft_assign:
-                A = self._soft_assignments(xs)
-            else:
-                A = self._hard_assignments(xs)
-            zns = torch.matmul(A, cb)
-        else:
-            zns, _ = self.encoder_zn(xs)
+    def _get_cell_embedding(self, xs):           
+        zns, _ = self.encoder_zn(xs)
         return zns 
     
-    def get_cell_coordinates(self, 
+    def get_cell_embedding(self, 
                              xs, 
-                             batch_size: int = 1024, 
-                             use_decoder: bool = False, 
-                             soft_assign: bool = False):
+                             batch_size: int = 1024):
         """
         Return cells' latent representations
 
@@ -940,6 +676,7 @@ class SURE(nn.Module):
         soft_assign
             If toggled on, the assignments of cells will use probabilistic values.
         """
+        xs = self.preprocess(xs)
         xs = convert_to_tensor(xs, device=self.get_device())
         dataset = CustomDataset(xs)
         dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
@@ -947,27 +684,12 @@ class SURE(nn.Module):
         Z = []
         with tqdm(total=len(dataloader), desc='', unit='batch') as pbar:
             for X_batch, _ in dataloader:
-                zns = self._get_cell_coordinates(X_batch, use_decoder=use_decoder, soft_assign=soft_assign)
+                zns = self._get_cell_embedding(X_batch)
                 Z.append(tensor_to_numpy(zns))
                 pbar.update(1)
 
         Z = np.concatenate(Z)
         return Z
-    
-    def _get_codebook(self):
-        I = torch.eye(self.code_size, **self.options)
-        if self.latent_dist=='studentt':
-            _,cb_loc,cb_scale = self.codebook(I)
-        else:
-            cb_loc,cb_scale = self.codebook(I)
-        return cb_loc,cb_scale
-    
-    def get_codebook(self):
-        """
-        Return the entire metacell codebook
-        """
-        cb_loc,cb_scale = self._get_codebook()
-        return tensor_to_numpy(cb_loc),tensor_to_numpy(cb_scale)
     
     def _code(self, xs):
         if self.supervised_mode:
@@ -978,6 +700,7 @@ class SURE(nn.Module):
         return alpha
     
     def code(self, xs, batch_size=1024):
+        xs = self.preprocess(xs)
         xs = convert_to_tensor(xs, device=self.get_device())
         dataset = CustomDataset(xs)
         dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
@@ -1001,6 +724,7 @@ class SURE(nn.Module):
         """
         Map cells to metacells and return the probabilistic values of metacell assignments
         """
+        xs = self.preprocess(xs)
         xs = convert_to_tensor(xs, device=self.get_device())
         dataset = CustomDataset(xs)
         dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
@@ -1025,6 +749,7 @@ class SURE(nn.Module):
         """
         Map cells to metacells and return the assigned metacell identities.
         """
+        xs = self.preprocess(xs)
         xs = convert_to_tensor(xs, device=self.get_device())
         dataset = CustomDataset(xs)
         dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
@@ -1039,288 +764,10 @@ class SURE(nn.Module):
         A = np.concatenate(A)
         return A
     
-    def _expression(self,zns):
-        if self.use_undesired:
-            ks2 = torch.zeros(zns.shape[0], self.undesired_size, **self.options)
-            zs=[ks2,zns]
-        else:
-            zs=zns
-
-        if not (self.loss_func in ['gaussian','lognormal']):
-            concentrate = self.decoder_concentrate(zs)
-        else:
-            concentrate,_ = self.decoder_concentrate(zs)
-
-        return concentrate
-    
-    def _count(self,concentrate,total_counts_per_cell=1e6):
-        if self.dist_model == 'dmm':
-            concentrate = self.dirimulti_param(concentrate)
-            theta = dist.DirichletMultinomial(total_count=1, concentration=concentrate).mean
-        elif self.dist_model == 'mm':
-            probs = self.multi_param(concentrate)
-            theta = dist.Multinomial(total_count=int(1), probs=probs).mean
-
-        counts = theta * total_counts_per_cell
-        return counts
-    
-    def _count_sample_bk(self,concentrate,total_counts_per_cell=1e6):
-        if self.dist_model == 'dmm':
-            concentrate = self.dirimulti_param(concentrate)
-            counts = dist.DirichletMultinomial(total_count=total_counts_per_cell, concentration=concentrate).sample()
-        elif self.dist_model == 'mm':
-            probs = self.multi_param(concentrate)
-            counts = dist.Multinomial(total_count=int(total_counts_per_cell), probs=probs).sample()
-
-        return counts
-    
-    def _count_sample_poisson(self,concentrate,total_counts_per_cell=1e4):
-        counts = self._count(concentrate=concentrate, total_counts_per_cell=total_counts_per_cell)
-        counts = dist.Poisson(rate=counts).to_event(1).sample()
-        return counts
-    
-    def _count_sample(self,concentrate,total_count=1e3):
-        #theta = self._count(concentrate=concentrate, total_counts_per_cell=1)
-        theta = self.sigmoid(concentrate)
-        counts = dist.NegativeBinomial(total_count=int(total_count), probs=theta).to_event(1).sample()
-        return counts
-    
-    def _count_sample_nb(self,concentrate,total_count=1e3):
-        return self._count_sample(concentrate=concentrate, total_count=total_count)
-
-    def get_cell_expressions(self, xs, 
-                             batch_size: int = 1024, 
-                             use_decoder: bool = False, 
-                             soft_assign: bool = True):
-        """
-        Return the scaled expression data of input cells.
-
-        Parameters
-        ----------
-        xs
-            Single-cell expression matrix. It should be a Numpy array or a Pytorch Tensor. Rows are cells and columns are features.
-        batch_size
-            Size of batch processing
-        """
-        xs = convert_to_tensor(xs, device=self.get_device())
-        dataset = CustomDataset(xs)
-        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
-
-        E = []
-        with tqdm(total=len(dataloader), desc='', unit='batch') as pbar:
-            for X_batch, _ in dataloader:
-                zns = self._get_cell_coordinates(X_batch, use_decoder=use_decoder, soft_assign=soft_assign)
-                concentrate = self._expression(zns)
-                E.append(tensor_to_numpy(concentrate))
-                pbar.update(1)
-        
-        E = np.concatenate(E)
-        return E
-    
-    def get_cell_counts(self, xs, 
-                        total_count: float = 1e3, 
-                        total_counts_per_cell: float = 1e6, 
-                        batch_size: int = 1024, 
-                        use_decoder: bool = False, 
-                        soft_assign: bool = True, 
-                        use_sampler: bool = False, 
-                        sample_method: Literal['nb','negbinomial','poisson'] = 'nb'):
-        """
-        Return the simulated count data of input cells.
-
-        Parameters
-        ----------
-        xs
-            Single-cell expression matrix. It should be a Numpy array or a Pytorch Tensor. Rows are cells and columns are features.
-        total_count
-            Paramter for negative binomial distribution.
-        total_counts_per_cell
-            Parameter for poisson distribution.
-        batch_size
-            Size of batch processing.
-        use_decoder
-            If toggled on, it will use latent representations reconstructed from metacells.
-        soft_assign
-            If toggled on, soft metacell assignments will be used instead of hard assignments.
-        use_sampler
-            If toggled on, data generation is done by sampling from the distribution.
-        sample_method
-            Method for sampling data. It will draw samples from negative binomial distribution or poisson distribution.
-        """
-        xs = convert_to_tensor(xs, device=self.get_device())
-        dataset = CustomDataset(xs)
-        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
-        
-        E = []
-        with tqdm(total=len(dataloader), desc='', unit='batch') as pbar:
-            for X_batch, _ in dataloader:
-                zns = self._get_cell_coordinates(X_batch, use_decoder=use_decoder, soft_assign=soft_assign)
-                concentrate = self._expression(zns)
-                if use_sampler:
-                    if sample_method.lower() in ['nb','negbinomial']:
-                        counts = self._count_sample(concentrate,total_count)
-                    elif sample_method.lower() in ['poisson']:
-                        counts = self._count_sample_poisson(concentrate, total_counts_per_cell)
-                else:
-                    counts = self._count(concentrate,total_counts_per_cell)
-                E.append(tensor_to_numpy(counts))
-                pbar.update(1)
-        
-        E = np.concatenate(E)
-        return E
-    
-    def scale_data(self, xs, 
-                   batch_size: int = 1024):
-        """
-        Return the scaled expression data of input data.
-
-        Parameters
-        ----------
-        xs
-            Single-cell experssion matrix. It should be a Numpy array or a Pytorch Tensor. Rows are cells and columns are features.
-        batch_size
-            Size of batch processing.
-        """
-        xs = convert_to_tensor(xs, device=self.get_device())
-        dataset = CustomDataset(xs)
-        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
-
-        E = []
-        with tqdm(total=len(dataloader), desc='', unit='batch') as pbar:
-            for X_batch, _ in dataloader:
-                zns = self._get_cell_coordinates(X_batch, use_decoder=False, soft_assign=False)
-                concentrate = self._expression(zns)
-                E.append(tensor_to_numpy(concentrate))
-                pbar.update(1)
-        
-        E = np.concatenate(E)
-        return E
-    
-    def generate_scaled_data(self, zs, 
-                             batch_size: int = 1024):
-        """
-        Return the scaled data of input latent representations.
-
-        Parameters
-        ----------
-        zs
-            Input latent representations. It should be a Numpy array or a Pytorch Tensor. Rows are cells.
-        batch_size
-            Size of batch processing.
-        """
-        zs = convert_to_tensor(zs, device=self.get_device())
-        dataset = CustomDataset(zs)
-        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
-
-        E = []
-        with tqdm(total=len(dataloader), desc='', unit='batch') as pbar:
-            for batch_z, _ in dataloader:
-                concentrate = self._expression(batch_z)
-                E.append(tensor_to_numpy(concentrate))
-                pbar.update(1)
-        
-        E = np.concatenate(E)
-        return E
-    
-    def generate_count_data(self, zs, 
-                            batch_size: int = 1024, 
-                            total_count: float = 1e3, 
-                            total_counts_per_cell: float = 1e4, 
-                            sample_method: Literal['nb','negbinomial','poisson'] = 'nb'):
-        """
-        Return the simulated data of input latent representations.
-
-        Parameters
-        ----------
-        zs
-            Input latent representations. It should be a Numpy array or a Pytorch Tensor. Rows are cells.
-        batch_size
-            Size of batch processing.
-        total_count
-            Parameter for negative binomial generator.
-        total_counts_per_cell
-            Parameter for poisson generator.
-        sample_method
-            Method for sampling data. It will draw samples from negative binomial distribution or poisson distribution.
-        """
-        zs = convert_to_tensor(zs, device=self.get_device())
-        dataset = CustomDataset(zs)
-        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
-
-        E = []
-        with tqdm(total=len(dataloader), desc='', unit='batch') as pbar:
-            for batch_z, _ in dataloader:
-                concentrate = self._expression(batch_z)
-                if sample_method.lower() == 'nb':
-                    counts = self._count_sample(concentrate, total_count)
-                elif sample_method.lower() == 'poisson':
-                    counts = self._count_sample_poisson(concentrate, total_counts_per_cell)
-                E.append(tensor_to_numpy(counts))
-                pbar.update(1)
-        
-        E = np.concatenate(E)
-        return E
-    
-    def log_prob(self, xs, 
-                 batch_size: int = 1024):
-        """
-        Return probabilistic score of input data.
-
-        Parameters
-        ----------
-        xs
-            Single-cell experssion matrix. It should be a Numpy array or a Pytorch Tensor. Rows are cells and columns are features.
-        batch_size
-            Size of batch processing.
-        """
-        xs = convert_to_tensor(xs, device=self.get_device())
-        dataset = CustomDataset(xs)
-        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
-
-        codebook_loc,codebook_scale = self._get_codebook()
-
-        log_prob_sum = 0.0
-        with tqdm(total=len(dataloader), desc='', unit='batch') as pbar:
-            for batch_x, _ in dataloader:
-                z_q = self._get_cell_coordinates(batch_x)
-                z_a = self._soft_assignments(batch_x)
-                z_p_loc = torch.matmul(z_a, codebook_loc)
-                z_p_scale = torch.matmul(z_a, codebook_scale)
-                log_prob_sum += dist.Normal(z_p_loc, z_p_scale).to_event(1).log_prob(z_q).sum()
-                pbar.update(1)
-        
-        return tensor_to_numpy(log_prob_sum)
-    
-    def latent_log_prob(self, zs, 
-                        batch_size: int = 1024):
-        """
-        Return probabilistic score of input latent representations.
-
-        Parameters
-        ----------
-        zs
-            Input latent representations. It should be a Numpy array or a Pytorch Tensor. Rows are cells.
-        batch_size
-            Size of batch processing.
-        """
-        zs = convert_to_tensor(zs, device=self.get_device())
-        dataset = CustomDataset(zs)
-        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
-
-        codebook_loc,codebook_scale = self._get_codebook()
-
-        log_prob_sum = 0.0
-        with tqdm(total=len(dataloader), desc='', unit='batch') as pbar:
-            for batch_z, _ in dataloader:
-                z_q = batch_z
-                z_a = self.encoder_n(z_q)
-                z_a = self.softmax(z_a)
-                z_p_loc = torch.matmul(z_a, codebook_loc)
-                z_p_scale = torch.matmul(z_a, codebook_scale)
-                log_prob_sum += dist.Normal(z_p_loc, z_p_scale).to_event(1).log_prob(z_q).sum()
-                pbar.update(1)
-        
-        return tensor_to_numpy(log_prob_sum)
+    def preprocess(self, xs):
+        if sparse.issparse(xs):
+            xs = xs.toarray()
+        return xs 
     
     def fit(self, xs, 
             us = None, 
@@ -1364,7 +811,7 @@ class SURE(nn.Module):
             If toggled on, Jax will be used for speeding up. CAUTION: This will raise errors because of unknown reasons when it is called in
             the Python script or Jupyter notebook. It is OK if it is used when runing SURE in the shell command.
         """
-        
+        xs = self.preprocess(xs)
         xs = convert_to_tensor(xs, dtype=self.dtype, device=self.get_device())
         if us is not None:
             us = convert_to_tensor(us, dtype=self.dtype, device=self.get_device())

@@ -4,22 +4,23 @@ with open("README.md", "r") as fh:
     long_description = fh.read()
 
 setup(
-    name='SURE',
-    version='1.0',
+    name='SUREv1',
+    version='1.0.0',
     description='Succinct Representation of Single Cells',
     long_description=long_description,
     long_description_content_type="text/markdown",
     author='Feng Zeng',
     author_email='zengfeng@xmu.edu.cn',
     packages=find_packages(),
-    install_requires=['dill==0.3.8','scanpy','pytorch-ignite','datatable'],
+    install_requires=['dill==0.3.8','scanpy','pytorch-ignite','datatable','scipy','numpy','scikit-learn','pandas','pyro-ppl',
+                      'leidenalg','python-igraph','networkx','matplotlib','seaborn','fa2-modified'],
     classifiers=[
         'Programming Language :: Python :: 3',
         'License :: OSI Approved :: MIT License',
         'Operating System :: OS Independent',
     ],
-    python_requires='>=3.6',
-    url='https://github.com/ZengFLab/SUREv2',  # 项目的 GitHub 地址
+    python_requires='>=3.10',
+    url='https://github.com/ZengFLab/SURE',  # 项目的 GitHub 地址
 
     entry_points={
         'console_scripts': [

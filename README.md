@@ -5,31 +5,20 @@
 An update has been distributed. Users can access to it via [SUREv2](https://github.com/ZengFLab/SUREv2). It provides Python classes that users can call SURE in scripts. It also provide the command that users can run SURE in the shell. Additionally, SUREv2 supports the calling of metacells for multi-omics datasets.
 
 ## Installation
-1. Download SURE and enter the directory
+1. Create a virtual environment
 ```bash
-git clone https://github.com/ZengFLab/SURE.git && cd SURE
+conda create -n SUREv1 python=3.10 scipy numpy pandas scikit-learn && conda activate SUREv1
 ```
 
-2. Create a virtual environment
+2. Install [PyTorch](https://pytorch.org/get-started/locally/) following the official instruction. 
 ```bash
-conda env create -f environment.yml
+pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu126
 ```
 
-3. Activate the created environment. 
+3. Install SURE
 ```bash
-conda activate SURE
+pip3 install SUREv1
 ```
-
-4. Install SURE
-```bash
-pip install .
-```
-
-5. Test whether SURE has been installed
-- Test the metacell command for single omics data
-    ```bash
-    SURE --help
-    ```
 
 ## Example 1: Calling metacells for a single-cell dataset
 
