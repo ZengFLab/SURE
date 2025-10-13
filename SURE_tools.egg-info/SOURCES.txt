@@ -12,9 +12,9 @@ SURE/utils/__init__.py
 SURE/utils/custom_mlp.py
 SURE/utils/queue.py
 SURE/utils/utils.py
-SUREv1.egg-info/PKG-INFO
-SUREv1.egg-info/SOURCES.txt
-SUREv1.egg-info/dependency_links.txt
-SUREv1.egg-info/entry_points.txt
-SUREv1.egg-info/requires.txt
-SUREv1.egg-info/top_level.txt
+SURE_tools.egg-info/PKG-INFO
+SURE_tools.egg-info/SOURCES.txt
+SURE_tools.egg-info/dependency_links.txt
+SURE_tools.egg-info/entry_points.txt
+SURE_tools.egg-info/requires.txt
+SURE_tools.egg-info/top_level.txt

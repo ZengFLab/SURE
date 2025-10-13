@@ -102,7 +102,7 @@ class SURE(nn.Module):
                  z_dist: Literal['normal','studentt','laplacian','cauchy','gumbel'] = 'normal',
                  loss_func: Literal['negbinomial','poisson','multinomial'] = 'negbinomial',
                  inverse_dispersion: float = 10.0,
-                 use_zeroinflate: bool = False,
+                 use_zeroinflate: bool = True,
                  hidden_layers: list = [500],
                  hidden_layer_activation: Literal['relu','softplus','leakyrelu','linear'] = 'relu',
                  nn_dropout: float = 0.1,
@@ -373,12 +373,12 @@ class SURE(nn.Module):
                 theta = dist.DirichletMultinomial(total_count=1, concentration=rate).mean
 
             if self.loss_func == 'negbinomial':
-                if self.use_exact_zeroinflate:
+                if self.use_zeroinflate:
                     pyro.sample('x', dist.ZeroInflatedDistribution(dist.NegativeBinomial(total_count=total_count, probs=theta),gate_logits=gate_logits).to_event(1), obs=xs)
                 else:
                     pyro.sample('x', dist.NegativeBinomial(total_count=total_count, probs=theta).to_event(1), obs=xs)
             elif self.loss_func == 'poisson':
-                if self.use_exact_zeroinflate:
+                if self.use_zeroinflate:
                     pyro.sample('x', dist.ZeroInflatedDistribution(dist.Poisson(rate=rate),gate_logits=gate_logits).to_event(1), obs=xs.round())
                 else:
                     pyro.sample('x', dist.Poisson(rate=rate).to_event(1), obs=xs.round())
@@ -447,12 +447,12 @@ class SURE(nn.Module):
                 theta = dist.DirichletMultinomial(total_count=1, concentration=rate).mean
 
             if self.loss_func == 'negbinomial':
-                if self.use_exact_zeroinflate:
+                if self.use_zeroinflate:
                     pyro.sample('x', dist.ZeroInflatedDistribution(dist.NegativeBinomial(total_count=total_count, probs=theta),gate_logits=gate_logits).to_event(1), obs=xs)
                 else:
                     pyro.sample('x', dist.NegativeBinomial(total_count=total_count, probs=theta).to_event(1), obs=xs)
             elif self.loss_func == 'poisson':
-                if self.use_exact_zeroinflate:
+                if self.use_zeroinflate:
                     pyro.sample('x', dist.ZeroInflatedDistribution(dist.Poisson(rate=rate),gate_logits=gate_logits).to_event(1), obs=xs.round())
                 else:
                     pyro.sample('x', dist.Poisson(rate=rate).to_event(1), obs=xs.round())
@@ -533,12 +533,12 @@ class SURE(nn.Module):
                 theta = dist.DirichletMultinomial(total_count=1, concentration=rate).mean
 
             if self.loss_func == 'negbinomial':
-                if self.use_exact_zeroinflate:
+                if self.use_zeroinflate:
                     pyro.sample('x', dist.ZeroInflatedDistribution(dist.NegativeBinomial(total_count=total_count, probs=theta),gate_logits=gate_logits).to_event(1), obs=xs)
                 else:
                     pyro.sample('x', dist.NegativeBinomial(total_count=total_count, probs=theta).to_event(1), obs=xs)
             elif self.loss_func == 'poisson':
-                if self.use_exact_zeroinflate:
+                if self.use_zeroinflate:
                     pyro.sample('x', dist.ZeroInflatedDistribution(dist.Poisson(rate=rate),gate_logits=gate_logits).to_event(1), obs=xs.round())
                 else:
                     pyro.sample('x', dist.Poisson(rate=rate).to_event(1), obs=xs.round())
@@ -621,12 +621,12 @@ class SURE(nn.Module):
                 theta = dist.DirichletMultinomial(total_count=1, concentration=rate).mean
 
             if self.loss_func == 'negbinomial':
-                if self.use_exact_zeroinflate:
+                if self.use_zeroinflate:
                     pyro.sample('x', dist.ZeroInflatedDistribution(dist.NegativeBinomial(total_count=total_count, probs=theta),gate_logits=gate_logits).to_event(1), obs=xs)
                 else:
                     pyro.sample('x', dist.NegativeBinomial(total_count=total_count, probs=theta).to_event(1), obs=xs)
             elif self.loss_func == 'poisson':
-                if self.use_exact_zeroinflate:
+                if self.use_zeroinflate:
                     pyro.sample('x', dist.ZeroInflatedDistribution(dist.Poisson(rate=rate),gate_logits=gate_logits).to_event(1), obs=xs.round())
                 else:
                     pyro.sample('x', dist.Poisson(rate=rate).to_event(1), obs=xs.round())

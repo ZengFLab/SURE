@@ -4,8 +4,8 @@ with open("README.md", "r") as fh:
     long_description = fh.read()
 
 setup(
-    name='SUREv1',
-    version='1.0.0',
+    name='SURE-tools',
+    version='1.0.2',
     description='Succinct Representation of Single Cells',
     long_description=long_description,
     long_description_content_type="text/markdown",

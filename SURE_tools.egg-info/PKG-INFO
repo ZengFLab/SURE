@@ -1,6 +1,6 @@
 Metadata-Version: 2.1
-Name: SUREv1
-Version: 1.0.0
+Name: SURE-tools
+Version: 1.0.2
 Summary: Succinct Representation of Single Cells
 Home-page: https://github.com/ZengFLab/SURE
 Author: Feng Zeng
@@ -46,7 +46,7 @@ pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu12
 
 3. Install SURE
 ```bash
-pip3 install SUREv1
+pip3 install SURE-tools
 ```
 
 ## Example 1: Calling metacells for a single-cell dataset

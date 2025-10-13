@@ -17,7 +17,7 @@ pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu12
 
 3. Install SURE
 ```bash
-pip3 install SUREv1
+pip3 install SURE-tools
 ```
 
 ## Example 1: Calling metacells for a single-cell dataset
