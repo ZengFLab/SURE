@@ -85,6 +85,7 @@ class MLP(nn.Module):
         post_act_fct=lambda layer_ix, total_layers, layer: None,
         allow_broadcast=False,
         use_cuda=False,
+        bias=True,
     ):
         # init the module object
         super().__init__()
@@ -114,11 +115,12 @@ class MLP(nn.Module):
             assert type(layer_size) == int, "Hidden layer sizes must be ints"
 
             # get our nn layer module (in this case nn.Linear by default)
-            cur_linear_layer = nn.Linear(last_layer_size, layer_size)
+            cur_linear_layer = nn.Linear(last_layer_size, layer_size, bias=bias)
 
             # for numerical stability -- initialize the layer properly
             cur_linear_layer.weight.data.normal_(0, 0.001)
-            cur_linear_layer.bias.data.normal_(0, 0.001)
+            if bias:
+                cur_linear_layer.bias.data.normal_(0, 0.001)
 
             # use GPUs to share data during training (if available)
             if use_cuda:
@@ -160,7 +162,7 @@ class MLP(nn.Module):
         ), "output_size must be int, list, tuple"
 
         if type(output_size) == int:
-            all_modules.append(nn.Linear(last_layer_size, output_size))
+            all_modules.append(nn.Linear(last_layer_size, output_size, bias=bias))
             if output_activation is not None:
                 all_modules.append(
                     call_nn_op(output_activation)
@@ -179,7 +181,7 @@ class MLP(nn.Module):
                 split_layer = []
 
                 # we have an activation function
-                split_layer.append(nn.Linear(last_layer_size, out_size))
+                split_layer.append(nn.Linear(last_layer_size, out_size, bias=bias))
 
                 # then we get our output activation (either we repeat all or we index into a same sized array)
                 act_out_fct = (
@@ -207,3 +209,110 @@ class MLP(nn.Module):
     # pass through our sequential for the output!
     def forward(self, *args, **kwargs):
         return self.sequential_mlp.forward(*args, **kwargs)
+
+
+
+
+class ZeroBiasMLP(nn.Module):
+    def __init__(
+        self,
+        mlp_sizes,
+        activation=nn.ReLU,
+        output_activation=None,
+        post_layer_fct=lambda layer_ix, total_layers, layer: None,
+        post_act_fct=lambda layer_ix, total_layers, layer: None,
+        allow_broadcast=False,
+        use_cuda=False,
+    ):
+        # init the module object
+        super().__init__()
+        self.mlp = MLP(mlp_sizes=mlp_sizes,
+                       activation=activation,
+                       output_activation=output_activation,
+                       post_layer_fct=post_layer_fct,
+                       post_act_fct=post_act_fct,
+                       allow_broadcast=allow_broadcast,
+                       use_cuda=use_cuda,
+                       bias=True)
+        
+    # pass through our sequential for the output!
+    def forward(self, x):
+        y = self.mlp(x)
+        mask = torch.zeros_like(y)
+        if len(y.shape)==2:
+            if type(x)==list:
+                mask[x[1][:,0]>0,:] = 1
+            else:
+                mask[x[:,0]>0,:] = 1
+        elif len(y.shape)==3:
+            if type(x)==list:
+                mask[:,x[1][:,0]>0,:] = 1
+            else:
+                mask[:,x[:,0]>0,:] = 1
+        return y*mask
+        
+
+
+class ZeroBiasMLP2(nn.Module):
+    def __init__(
+        self,
+        mlp_sizes,
+        activation=nn.ReLU,
+        output_activation=None,
+        post_layer_fct=lambda layer_ix, total_layers, layer: None,
+        post_act_fct=lambda layer_ix, total_layers, layer: None,
+        allow_broadcast=False,
+        use_cuda=False,
+    ):
+        # init the module object
+        super().__init__()
+        self.mlp = MLP(mlp_sizes=mlp_sizes,
+                       activation=activation,
+                       output_activation=output_activation,
+                       post_layer_fct=post_layer_fct,
+                       post_act_fct=post_act_fct,
+                       allow_broadcast=allow_broadcast,
+                       use_cuda=use_cuda,
+                       bias=True)
+        
+    # pass through our sequential for the output!
+    def forward(self, x):
+        y = self.mlp(x)
+        mask = torch.zeros_like(y)
+        x_sum = torch.sum(x, dim=1)
+        mask[x_sum>0,:] = 1
+        return y*mask
+    
+class HDMLP(nn.Module):
+    def __init__(
+        self,
+        input_size,
+        hidden_sizes,
+        output_depth,
+        activation=nn.ReLU,
+        output_activation=None,
+        post_layer_fct=lambda layer_ix, total_layers, layer: None,
+        post_act_fct=lambda layer_ix, total_layers, layer: None,
+        allow_broadcast=False,
+        use_cuda=False,
+    ):
+        # init the module object
+        super().__init__()
+        self.mlp = MLP(mlp_sizes=[1] + hidden_sizes + [output_depth],
+                       activation=activation,
+                       output_activation=output_activation,
+                       post_layer_fct=post_layer_fct,
+                       post_act_fct=post_act_fct,
+                       allow_broadcast=allow_broadcast,
+                       use_cuda=use_cuda,
+                       bias=True)
+        self.input_size=input_size
+        self.output_depth=output_depth
+        
+    # pass through our sequential for the output!
+    def forward(self, x):
+        batch_size, n = x.shape
+        x = x.view(batch_size * n, 1)
+        out = self.mlp(x)
+        out = out.view(batch_size, n, self.output_depth)
+        return out

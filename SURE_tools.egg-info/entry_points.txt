@@ -1,2 +1,3 @@
 [console_scripts]
+PerturbFlow = PerturbFlow.PerturbFlow:main
 SURE = SURE.SURE:main

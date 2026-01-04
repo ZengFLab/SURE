@@ -7,7 +7,8 @@ from .utils import find_partitions_greedy
 
 from .queue import PriorityQueue
 
-from .custom_mlp import MLP, Exp
+from .custom_mlp import MLP, Exp, ZeroBiasMLP, HDMLP
+from .label import LabelMatrix
 
 # Importing modules
 #from . import utils

@@ -7,9 +7,11 @@ numpy
 scikit-learn
 pandas
 pyro-ppl
+jax[cuda12]
 leidenalg
 python-igraph
 networkx
 matplotlib
 seaborn
 fa2-modified
+zuko

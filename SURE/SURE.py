@@ -10,9 +10,14 @@ from torch.distributions.utils import logits_to_probs, probs_to_logits, clamp_pr
 from torch.distributions import constraints
 from torch.distributions.transforms import SoftmaxTransform
 
-from .utils.custom_mlp import MLP, Exp
-from .utils.utils import CustomDataset, CustomDataset3, CustomDataset4, tensor_to_numpy, convert_to_tensor
+from .utils.custom_mlp import MLP, Exp, ZeroBiasMLP2
+from .utils.utils import CustomDataset, CustomDataset2, CustomDataset4, tensor_to_numpy, convert_to_tensor
 
+from .dist.negbinomial import NegativeBinomial as MyNB
+from .dist.negbinomial import ZeroInflatedNegativeBinomial as MyZINB
+
+import zuko 
+from pyro.contrib.zuko import ZukoToPyro
 
 import os
 import argparse
@@ -21,6 +26,9 @@ import numpy as np
 import datatable as dt
 from tqdm import tqdm
 from scipy import sparse
+
+import scanpy as sc
+from .atac import binarize
 
 from typing import Literal
 
@@ -58,14 +66,18 @@ class SURE(nn.Module):
     ----------
     inpute_size
         Number of features (e.g., genes, peaks, proteins, etc.) per cell.
-    undesired_size
-        Number of undesired factors. It would be used to adjust for undesired variations like batch effect.
     codebook_size
         Number of metacells.
-    latent_dim
+    cov_size
+        Number of cell-level factors. 
+    transforms
+        Number of neural spline flows
+    z_dim
         Dimensionality of latent states and metacells. 
     hidden_layers
-        A list give the numbers of neurons for each hidden layer.
+        A list gives the numbers of neurons for each hidden layer.
+    flow_hidden_layers
+        A list gives the numbers of neurons for each hidden layer in neural spline flows.
     loss_func
         The likelihood model for single-cell data generation. 
         
@@ -73,16 +85,6 @@ class SURE(nn.Module):
         * ``'negbinomial'`` -  negative binomial distribution (default)
         * ``'poisson'`` - poisson distribution
         * ``'multinomial'`` - multinomial distribution
-    user_dirichlet
-        A boolean option. If toggled on, SURE characterizes single-cell data using a hierarchical model, such as
-        dirichlet-negative binomial.
-    latent_dist
-        The distribution model for latent states. 
-        
-        One of the following:
-        * ``'normal'`` - normal distribution
-        * ``'laplacian'`` - Laplacian distribution
-        * ``'studentt'`` - Student-t distribution. 
     use_cuda
         A boolean option for switching on cuda device. 
 
@@ -94,46 +96,48 @@ class SURE(nn.Module):
 
     """
     def __init__(self,
-                 input_size: int,
-                 codebook_size: int = 200,
-                 cell_factor_size: int = 0,
-                 supervised_mode: bool = False,
-                 z_dim: int = 10,
-                 z_dist: Literal['normal','studentt','laplacian','cauchy','gumbel'] = 'normal',
-                 loss_func: Literal['negbinomial','poisson','multinomial'] = 'negbinomial',
-                 inverse_dispersion: float = 10.0,
+                 input_dim: int,
+                 codebook_size: int,
+                 cov_size: int = 0,
+                 transforms: int = 3,
+                 z_dim: int = 50,
+                 z_dist: Literal['normal','studentt','laplacian','cauchy','gumbel'] = 'studentt',
+                 loss_func: Literal['negbinomial','poisson','multinomial','bernoulli'] = 'negbinomial',
+                 dispersion: float = 10.0,
                  use_zeroinflate: bool = True,
                  hidden_layers: list = [500],
                  hidden_layer_activation: Literal['relu','softplus','leakyrelu','linear'] = 'relu',
+                 flow_hidden_layers = [128,128],
                  nn_dropout: float = 0.1,
                  post_layer_fct: list = ['layernorm'],
                  post_act_fct: list = None,
                  config_enum: str = 'parallel',
-                 use_cuda: bool = False,
+                 use_cuda: bool = True,
                  seed: int = 42,
                  dtype = torch.float32, # type: ignore
                  ):
         super().__init__()
 
-        self.input_size = input_size
-        self.cell_factor_size = cell_factor_size
-        self.inverse_dispersion = inverse_dispersion
+        self.input_dim = input_dim
+        self.cov_size = cov_size
+        self.dispersion = dispersion
         self.latent_dim = z_dim
+        self.latent_dist = z_dist
         self.hidden_layers = hidden_layers
         self.decoder_hidden_layers = hidden_layers[::-1]
         self.allow_broadcast = config_enum == 'parallel'
         self.use_cuda = use_cuda
         self.loss_func = loss_func
         self.options = None
-        self.code_size=codebook_size
-        self.supervised_mode=supervised_mode
-        self.latent_dist = z_dist
+        self.code_dim=codebook_size
         self.dtype = dtype
         self.use_zeroinflate=use_zeroinflate
         self.nn_dropout = nn_dropout
         self.post_layer_fct = post_layer_fct
         self.post_act_fct = post_act_fct
         self.hidden_layer_activation = hidden_layer_activation
+        self.transforms = transforms
+        self.flow_hidden_layers = flow_hidden_layers
         
         self.codebook_weights = None
 
@@ -200,19 +204,8 @@ class SURE(nn.Module):
         elif self.hidden_layer_activation == 'linear':
             activate_fct = nn.Identity
 
-        if self.supervised_mode:
-            self.encoder_n = MLP(
-                [self.input_size] + hidden_sizes + [self.code_size],
-                activation=activate_fct,
-                output_activation=None,
-                post_layer_fct=post_layer_fct,
-                post_act_fct=post_act_fct,
-                allow_broadcast=self.allow_broadcast,
-                use_cuda=self.use_cuda,
-            )
-        else:
-            self.encoder_n = MLP(
-                [self.latent_dim] + hidden_sizes + [self.code_size],
+        self.encoder_n = MLP(
+                [self.latent_dim] + hidden_sizes + [self.code_dim],
                 activation=activate_fct,
                 output_activation=None,
                 post_layer_fct=post_layer_fct,
@@ -221,29 +214,19 @@ class SURE(nn.Module):
                 use_cuda=self.use_cuda,
             )
 
-        self.encoder_zn = MLP(
-            [self.input_size] + hidden_sizes + [[latent_dim, latent_dim]],
+        '''self.encoder_zn = MLP(
+            [self.input_dim] + hidden_sizes + [[latent_dim, latent_dim]],
             activation=activate_fct,
             output_activation=[None, Exp],
             post_layer_fct=post_layer_fct,
             post_act_fct=post_act_fct,
             allow_broadcast=self.allow_broadcast,
             use_cuda=self.use_cuda,
-        )
+        )'''
 
-        if self.cell_factor_size>0:
-            self.cell_factor_effect = MLP(
-                    [self.cell_factor_size] + self.decoder_hidden_layers + [self.latent_dim],
-                    activation=activate_fct,
-                    output_activation=None,
-                    post_layer_fct=post_layer_fct,
-                    post_act_fct=post_act_fct,
-                    allow_broadcast=self.allow_broadcast,
-                    use_cuda=self.use_cuda,
-                )
-            
-        self.decoder_concentrate = MLP(
-                [self.latent_dim] + self.decoder_hidden_layers + [self.input_size],
+        if self.cov_size>0:
+            self.covariate_effect = ZeroBiasMLP2(
+                [self.cov_size] + self.decoder_hidden_layers + [self.latent_dim],
                 activation=activate_fct,
                 output_activation=None,
                 post_layer_fct=post_layer_fct,
@@ -251,10 +234,20 @@ class SURE(nn.Module):
                 allow_broadcast=self.allow_broadcast,
                 use_cuda=self.use_cuda,
             )
-
+            
+        self.decoder_log_mu = MLP(
+                [self.latent_dim] + self.decoder_hidden_layers + [self.input_dim],
+                activation=activate_fct,
+                output_activation=None,
+                post_layer_fct=post_layer_fct,
+                post_act_fct=post_act_fct,
+                allow_broadcast=self.allow_broadcast,
+                use_cuda=self.use_cuda,
+            )
+        
         if self.latent_dist == 'studentt':
             self.codebook = MLP(
-                [self.code_size] + hidden_sizes + [[latent_dim,latent_dim]],
+                [self.code_dim] + hidden_sizes + [[latent_dim,latent_dim]],
                 activation=activate_fct,
                 output_activation=[Exp,None],
                 post_layer_fct=post_layer_fct,
@@ -264,7 +257,7 @@ class SURE(nn.Module):
             )
         else:
             self.codebook = MLP(
-                [self.code_size] + hidden_sizes + [latent_dim],
+                [self.code_dim] + hidden_sizes + [latent_dim],
                 activation=activate_fct,
                 output_activation=None,
                 post_layer_fct=post_layer_fct,
@@ -273,6 +266,9 @@ class SURE(nn.Module):
                 use_cuda=self.use_cuda,
             )
 
+        self.encoder_zn = zuko.flows.NSF(features=self.latent_dim, context=self.input_dim, 
+                                         transforms=self.transforms, hidden_features=self.flow_hidden_layers)
+        
         if self.use_cuda:
             self.cuda()
 
@@ -324,7 +320,7 @@ class SURE(nn.Module):
         xs = self.softmax(xs)
         return xs
 
-    def model1(self, xs):
+    def model(self, xs, cs=None):
         pyro.module('sure', self)
 
         eps = torch.finfo(xs.dtype).eps
@@ -332,22 +328,22 @@ class SURE(nn.Module):
         self.options = dict(dtype=xs.dtype, device=xs.device)
         
         if self.loss_func=='negbinomial':
-            total_count = pyro.param("inverse_dispersion", self.inverse_dispersion *
-                                     xs.new_ones(self.input_size), constraint=constraints.positive)
+            dispersion = pyro.param("dispersion", self.dispersion *
+                                     xs.new_ones(self.input_dim), constraint=constraints.positive)
             
         if self.use_zeroinflate:
-            gate_logits = pyro.param("dropout_rate", xs.new_zeros(self.input_size))
-            
+            gate_logits = pyro.param("dropout_rate", xs.new_zeros(self.input_dim))
+
         acs_scale = pyro.param("codebook_scale", xs.new_ones(self.latent_dim), constraint=constraints.positive)
 
-        I = torch.eye(self.code_size)
+        I = torch.eye(self.code_dim)
         if self.latent_dist=='studentt':
             acs_dof,acs_loc = self.codebook(I)
         else:
             acs_loc = self.codebook(I)
-
+            
         with pyro.plate('data'):
-            prior = torch.zeros(batch_size, self.code_size, **self.options)
+            prior = torch.zeros(batch_size, self.code_dim, **self.options)
             ns = pyro.sample('n', dist.OneHotCategorical(logits=prior))
 
             zn_loc = torch.matmul(ns,acs_loc)
@@ -365,92 +361,29 @@ class SURE(nn.Module):
                 zns = pyro.sample('zn', dist.Normal(zn_loc, zn_scale).to_event(1))
             elif self.latent_dist == 'gumbel':
                 zns = pyro.sample('zn', dist.Gumbel(zn_loc, zn_scale).to_event(1))
-
-            zs = zns
-            concentrate = self.decoder_concentrate(zs)
-            rate = concentrate.exp()
-            if self.loss_func != 'poisson':
-                theta = dist.DirichletMultinomial(total_count=1, concentration=rate).mean
-
-            if self.loss_func == 'negbinomial':
-                if self.use_zeroinflate:
-                    pyro.sample('x', dist.ZeroInflatedDistribution(dist.NegativeBinomial(total_count=total_count, probs=theta),gate_logits=gate_logits).to_event(1), obs=xs)
-                else:
-                    pyro.sample('x', dist.NegativeBinomial(total_count=total_count, probs=theta).to_event(1), obs=xs)
-            elif self.loss_func == 'poisson':
-                if self.use_zeroinflate:
-                    pyro.sample('x', dist.ZeroInflatedDistribution(dist.Poisson(rate=rate),gate_logits=gate_logits).to_event(1), obs=xs.round())
-                else:
-                    pyro.sample('x', dist.Poisson(rate=rate).to_event(1), obs=xs.round())
-            elif self.loss_func == 'multinomial':
-                pyro.sample('x', dist.Multinomial(total_count=int(1e8), probs=theta), obs=xs)
-
-    def guide1(self, xs):
-        with pyro.plate('data'):
-            zn_loc, zn_scale = self.encoder_zn(xs)
-            zns = pyro.sample('zn', dist.Normal(zn_loc, zn_scale).to_event(1))
-
-            alpha = self.encoder_n(zns)
-            ns = pyro.sample('n', dist.OneHotCategorical(logits=alpha))
-
-    def model2(self, xs, us=None):
-        pyro.module('sure', self)
-
-        eps = torch.finfo(xs.dtype).eps
-        batch_size = xs.size(0)
-        self.options = dict(dtype=xs.dtype, device=xs.device)
-        
-        if self.loss_func=='negbinomial':
-            total_count = pyro.param("inverse_dispersion", self.inverse_dispersion *
-                                     xs.new_ones(self.input_size), constraint=constraints.positive)
-            
-        if self.use_zeroinflate:
-            gate_logits = pyro.param("dropout_rate", xs.new_zeros(self.input_size))
-            
-        acs_scale = pyro.param("codebook_scale", xs.new_ones(self.latent_dim), constraint=constraints.positive)
-
-        I = torch.eye(self.code_size)
-        if self.latent_dist=='studentt':
-            acs_dof,acs_loc = self.codebook(I)
-        else:
-            acs_loc = self.codebook(I)
-
-        with pyro.plate('data'):
-            prior = torch.zeros(batch_size, self.code_size, **self.options)
-            ns = pyro.sample('n', dist.OneHotCategorical(logits=prior))
-
-            zn_loc = torch.matmul(ns,acs_loc)
-            #zn_scale = torch.matmul(ns,acs_scale)
-            zn_scale = acs_scale
-
-            if self.latent_dist == 'studentt':
-                prior_dof = torch.matmul(ns,acs_dof)
-                zns = pyro.sample('zn', dist.StudentT(df=prior_dof, loc=zn_loc, scale=zn_scale).to_event(1))
-            elif self.latent_dist == 'laplacian':
-                zns = pyro.sample('zn', dist.Laplace(zn_loc, zn_scale).to_event(1))
-            elif self.latent_dist == 'cauchy':
-                zns = pyro.sample('zn', dist.Cauchy(zn_loc, zn_scale).to_event(1))
-            elif self.latent_dist == 'normal':
-                zns = pyro.sample('zn', dist.Normal(zn_loc, zn_scale).to_event(1))
-            elif self.latent_dist == 'gumbel':
-                zns = pyro.sample('zn', dist.Gumbel(zn_loc, zn_scale).to_event(1))
-
-            if self.cell_factor_size>0:
-                zus = self.cell_factor_effect(us)
-                zs = zns + zus
+                
+            if (self.cov_size>0) and (cs is not None):
+                zus = self.covariate_effect(cs)
+                zs = zns+zus
             else:
                 zs = zns
 
-            concentrate = self.decoder_concentrate(zs)
-            rate = concentrate.exp()
-            if self.loss_func != 'poisson':
+            log_mu = self.decoder_log_mu(zs)
+            if self.loss_func in ['bernoulli']:
+                log_theta = log_mu
+            elif self.loss_func in ['negbinomial']:
+                mu = log_mu.exp()
+            else:
+                rate = log_mu.exp()
                 theta = dist.DirichletMultinomial(total_count=1, concentration=rate).mean
+                if self.loss_func == 'poisson':
+                    rate = theta * torch.sum(xs, dim=1, keepdim=True)
 
             if self.loss_func == 'negbinomial':
                 if self.use_zeroinflate:
-                    pyro.sample('x', dist.ZeroInflatedDistribution(dist.NegativeBinomial(total_count=total_count, probs=theta),gate_logits=gate_logits).to_event(1), obs=xs)
+                    pyro.sample("x", MyZINB(mu=mu, theta=dispersion, zi_logits=gate_logits).to_event(1), obs=xs)
                 else:
-                    pyro.sample('x', dist.NegativeBinomial(total_count=total_count, probs=theta).to_event(1), obs=xs)
+                    pyro.sample("x", MyNB(mu=mu, theta=dispersion).to_event(1), obs=xs)
             elif self.loss_func == 'poisson':
                 if self.use_zeroinflate:
                     pyro.sample('x', dist.ZeroInflatedDistribution(dist.Poisson(rate=rate),gate_logits=gate_logits).to_event(1), obs=xs.round())
@@ -458,210 +391,47 @@ class SURE(nn.Module):
                     pyro.sample('x', dist.Poisson(rate=rate).to_event(1), obs=xs.round())
             elif self.loss_func == 'multinomial':
                 pyro.sample('x', dist.Multinomial(total_count=int(1e8), probs=theta), obs=xs)
+            elif self.loss_func == 'bernoulli':
+                if self.use_zeroinflate:
+                    pyro.sample('x', dist.ZeroInflatedDistribution(dist.Bernoulli(logits=log_theta),gate_logits=gate_logits).to_event(1), obs=xs)
+                else:
+                    pyro.sample('x', dist.Bernoulli(logits=log_theta).to_event(1), obs=xs)
 
-    def guide2(self, xs, us=None):
+    def guide(self, xs, cs=None):
         with pyro.plate('data'):
-            zn_loc, zn_scale = self.encoder_zn(xs)
-            zns = pyro.sample('zn', dist.Normal(zn_loc, zn_scale).to_event(1))
+            #zn_loc, zn_scale = self.encoder_zn(xs)
+            #zns = pyro.sample('zn', dist.Normal(zn_loc, zn_scale).to_event(1))
+            zns = pyro.sample('zn', ZukoToPyro(self.encoder_zn(xs)))
 
             alpha = self.encoder_n(zns)
             ns = pyro.sample('n', dist.OneHotCategorical(logits=alpha))
+            #ns = pyro.sample('n', dist.Dirichlet(concentration=alpha.exp()))
 
-    def model3(self, xs, ys, embeds=None):
-        pyro.module('sure', self)
-
-        eps = torch.finfo(xs.dtype).eps
-        batch_size = xs.size(0)
-        self.options = dict(dtype=xs.dtype, device=xs.device)
-        
-        if self.loss_func=='negbinomial':
-            total_count = pyro.param("inverse_dispersion", self.inverse_dispersion *
-                                     xs.new_ones(self.input_size), constraint=constraints.positive)
-            
-        if self.use_zeroinflate:
-            gate_logits = pyro.param("dropout_rate", xs.new_zeros(self.input_size))
-            
-        acs_scale = pyro.param("codebook_scale", xs.new_ones(self.latent_dim), constraint=constraints.positive)
-
-        I = torch.eye(self.code_size)
+    def _get_codebook(self, sample_size=10):
+        I = torch.eye(self.code_dim, **self.options)
         if self.latent_dist=='studentt':
-            acs_dof,acs_loc = self.codebook(I)
-        else:
-            acs_loc = self.codebook(I)
-
-        with pyro.plate('data'):
-            #prior = torch.zeros(batch_size, self.code_size, **self.options)
-            prior = self.encoder_n(xs)
-            ns = pyro.sample('n', dist.OneHotCategorical(logits=prior), obs=ys)
-
-            zn_loc = torch.matmul(ns,acs_loc)
-            #prior_scale = torch.matmul(ns,acs_scale)
-            zn_scale = acs_scale
-
-            if self.latent_dist=='studentt':
-                prior_dof = torch.matmul(ns,acs_dof)
-                if embeds is None:
-                    zns = pyro.sample('zn', dist.StudentT(df=prior_dof, loc=zn_loc, scale=zn_scale).to_event(1))
-                else:
-                    zns = pyro.sample('zn', dist.StudentT(df=prior_dof, loc=zn_loc, scale=zn_scale).to_event(1), obs=embeds)
-            elif self.latent_dist=='laplacian':
-                if embeds is None:
-                    zns = pyro.sample('zn', dist.Laplace(zn_loc, zn_scale).to_event(1))
-                else:
-                    zns = pyro.sample('zn', dist.Laplace(zn_loc, zn_scale).to_event(1), obs=embeds)
-            elif self.latent_dist=='cauchy':
-                if embeds is None:
-                    zns = pyro.sample('zn', dist.Cauchy(zn_loc, zn_scale).to_event(1))
-                else:
-                    zns = pyro.sample('zn', dist.Cauchy(zn_loc, zn_scale).to_event(1), obs=embeds)
-            elif self.latent_dist=='normal':
-                if embeds is None:
-                    zns = pyro.sample('zn', dist.Normal(zn_loc, zn_scale).to_event(1))
-                else:
-                    zns = pyro.sample('zn', dist.Normal(zn_loc, zn_scale).to_event(1), obs=embeds)
-            elif self.z_dist == 'gumbel':
-                if embeds is None:
-                    zns = pyro.sample('zn', dist.Gumbel(zn_loc, zn_scale).to_event(1))
-                else:
-                    zns = pyro.sample('zn', dist.Gumbel(zn_loc, zn_scale).to_event(1), obs=embeds)
-
-            zs = zns
-
-            concentrate = self.decoder_concentrate(zs)
-            rate = concentrate.exp()
-            if self.loss_func != 'poisson':
-                theta = dist.DirichletMultinomial(total_count=1, concentration=rate).mean
-
-            if self.loss_func == 'negbinomial':
-                if self.use_zeroinflate:
-                    pyro.sample('x', dist.ZeroInflatedDistribution(dist.NegativeBinomial(total_count=total_count, probs=theta),gate_logits=gate_logits).to_event(1), obs=xs)
-                else:
-                    pyro.sample('x', dist.NegativeBinomial(total_count=total_count, probs=theta).to_event(1), obs=xs)
-            elif self.loss_func == 'poisson':
-                if self.use_zeroinflate:
-                    pyro.sample('x', dist.ZeroInflatedDistribution(dist.Poisson(rate=rate),gate_logits=gate_logits).to_event(1), obs=xs.round())
-                else:
-                    pyro.sample('x', dist.Poisson(rate=rate).to_event(1), obs=xs.round())
-            elif self.loss_func == 'multinomial':
-                pyro.sample('x', dist.Multinomial(total_count=int(1e8), probs=theta), obs=xs)
-
-    def guide3(self, xs, ys, embeds=None):
-        with pyro.plate('data'):
-            if embeds is None:
-                zn_loc, zn_scale = self.encoder_zn(xs)
-                zns = pyro.sample('zn', dist.Normal(zn_loc, zn_scale).to_event(1))
-
-    def model4(self, xs, us, ys, embeds=None):
-        pyro.module('sure', self)
-
-        eps = torch.finfo(xs.dtype).eps
-        batch_size = xs.size(0)
-        self.options = dict(dtype=xs.dtype, device=xs.device)
-        
-        if self.loss_func=='negbinomial':
-            total_count = pyro.param("inverse_dispersion", self.inverse_dispersion *
-                                     xs.new_ones(self.input_size), constraint=constraints.positive)
-            
-        if self.use_zeroinflate:
-            gate_logits = pyro.param("dropout_rate", xs.new_zeros(self.input_size))
-            
-        acs_scale = pyro.param("codebook_scale", xs.new_ones(self.latent_dim), constraint=constraints.positive)
-
-        I = torch.eye(self.code_size)
-        if self.latent_dist=='studentt':
-            acs_dof,acs_loc = self.codebook(I)
-        else:
-            acs_loc = self.codebook(I)
-
-        with pyro.plate('data'):
-            #prior = torch.zeros(batch_size, self.code_size, **self.options)
-            prior = self.encoder_n(xs)
-            ns = pyro.sample('n', dist.OneHotCategorical(logits=prior), obs=ys)
-
-            zn_loc = torch.matmul(ns,acs_loc)
-            #prior_scale = torch.matmul(ns,acs_scale)
-            zn_scale = acs_scale
-
-            if self.latent_dist=='studentt':
-                prior_dof = torch.matmul(ns,acs_dof)
-                if embeds is None:
-                    zns = pyro.sample('zn', dist.StudentT(df=prior_dof, loc=zn_loc, scale=zn_scale).to_event(1))
-                else:
-                    zns = pyro.sample('zn', dist.StudentT(df=prior_dof, loc=zn_loc, scale=zn_scale).to_event(1), obs=embeds)
-            elif self.latent_dist=='laplacian':
-                if embeds is None:
-                    zns = pyro.sample('zn', dist.Laplace(zn_loc, zn_scale).to_event(1))
-                else:
-                    zns = pyro.sample('zn', dist.Laplace(zn_loc, zn_scale).to_event(1), obs=embeds)
-            elif self.latent_dist=='cauchy':
-                if embeds is None:
-                    zns = pyro.sample('zn', dist.Cauchy(zn_loc, zn_scale).to_event(1))
-                else:
-                    zns = pyro.sample('zn', dist.Cauchy(zn_loc, zn_scale).to_event(1), obs=embeds)
-            elif self.latent_dist=='normal':
-                if embeds is None:
-                    zns = pyro.sample('zn', dist.Normal(zn_loc, zn_scale).to_event(1))
-                else:
-                    zns = pyro.sample('zn', dist.Normal(zn_loc, zn_scale).to_event(1), obs=embeds)
-            elif self.z_dist == 'gumbel':
-                if embeds is None:
-                    zns = pyro.sample('zn', dist.Gumbel(zn_loc, zn_scale).to_event(1))
-                else:
-                    zns = pyro.sample('zn', dist.Gumbel(zn_loc, zn_scale).to_event(1), obs=embeds)
-
-            if self.cell_factor_size>0:
-                zus = self.cell_factor_effect(us)
-                zs = zus + zns
-            else:
-                zs = zns
-
-            concentrate = self.decoder_concentrate(zs)
-            rate = concentrate.exp()
-            if self.loss_func != 'poisson':
-                theta = dist.DirichletMultinomial(total_count=1, concentration=rate).mean
-
-            if self.loss_func == 'negbinomial':
-                if self.use_zeroinflate:
-                    pyro.sample('x', dist.ZeroInflatedDistribution(dist.NegativeBinomial(total_count=total_count, probs=theta),gate_logits=gate_logits).to_event(1), obs=xs)
-                else:
-                    pyro.sample('x', dist.NegativeBinomial(total_count=total_count, probs=theta).to_event(1), obs=xs)
-            elif self.loss_func == 'poisson':
-                if self.use_zeroinflate:
-                    pyro.sample('x', dist.ZeroInflatedDistribution(dist.Poisson(rate=rate),gate_logits=gate_logits).to_event(1), obs=xs.round())
-                else:
-                    pyro.sample('x', dist.Poisson(rate=rate).to_event(1), obs=xs.round())
-            elif self.loss_func == 'multinomial':
-                pyro.sample('x', dist.Multinomial(total_count=int(1e8), probs=theta), obs=xs)
-
-    def guide4(self, xs, us, ys, embeds=None):
-        with pyro.plate('data'):
-            if embeds is None:
-                zn_loc, zn_scale = self.encoder_zn(xs)
-                zns = pyro.sample('zn', dist.Normal(zn_loc, zn_scale).to_event(1))
-
-    def _get_codebook(self):
-        I = torch.eye(self.code_size, **self.options)
-        if self.latent_dist=='studentt':
-            _,cb = self.codebook(I)
+            cb,_ = self.codebook(I)
         else:
             cb = self.codebook(I)
         return cb
     
-    def get_codebook(self):
+    def get_codebook(self, sample_size=10):
         """
         Return the mean part of metacell codebook
         """
-        cb = self._get_metacell_coordinates()
+        cb = self._get_codebook(sample_size)
         cb = tensor_to_numpy(cb)
         return cb
 
     def _get_cell_embedding(self, xs):           
-        zns, _ = self.encoder_zn(xs)
+        #zns, _ = self.encoder_zn(xs)
+        zns = self.encoder_zn(xs).sample((10,)).mean(axis=0)
         return zns 
     
     def get_cell_embedding(self, 
                              xs, 
-                             batch_size: int = 1024):
+                             batch_size: int = 1024,
+                             show_progress: bool = True):
         """
         Return cells' latent representations
 
@@ -671,19 +441,18 @@ class SURE(nn.Module):
             Single-cell expression matrix. It should be a Numpy array or a Pytorch Tensor.
         batch_size
             Size of batch processing.
-        use_decoder
-            If toggled on, the latent representations will be reconstructed from the metacell codebook
-        soft_assign
-            If toggled on, the assignments of cells will use probabilistic values.
+        show_progress
+            Verbose on or off
         """
         xs = self.preprocess(xs)
-        xs = convert_to_tensor(xs, device=self.get_device())
+        xs = convert_to_tensor(xs, device='cpu')
         dataset = CustomDataset(xs)
         dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
 
         Z = []
-        with tqdm(total=len(dataloader), desc='', unit='batch') as pbar:
+        with tqdm(total=len(dataloader), disable=not show_progress, desc='', unit='batch') as pbar:
             for X_batch, _ in dataloader:
+                X_batch = X_batch.to(self.get_device())
                 zns = self._get_cell_embedding(X_batch)
                 Z.append(tensor_to_numpy(zns))
                 pbar.update(1)
@@ -692,22 +461,21 @@ class SURE(nn.Module):
         return Z
     
     def _code(self, xs):
-        if self.supervised_mode:
-            alpha = self.encoder_n(xs)
-        else:
-            zns,_ = self.encoder_zn(xs)
-            alpha = self.encoder_n(zns)
+        #zns,_ = self.encoder_zn(xs)
+        zns = self._get_cell_embedding(xs)
+        alpha = self.encoder_n(zns)
         return alpha
     
-    def code(self, xs, batch_size=1024):
+    def code(self, xs, batch_size=1024, show_progress=True):
         xs = self.preprocess(xs)
-        xs = convert_to_tensor(xs, device=self.get_device())
+        xs = convert_to_tensor(xs, device='cpu')
         dataset = CustomDataset(xs)
         dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
 
         A = []
-        with tqdm(total=len(dataloader), desc='', unit='batch') as pbar:
+        with tqdm(total=len(dataloader), disable=not show_progress, desc='', unit='batch') as pbar:
             for X_batch, _ in dataloader:
+                X_batch = X_batch.to(self.get_device())
                 a = self._code(X_batch)
                 A.append(tensor_to_numpy(a))
                 pbar.update(1)
@@ -720,18 +488,19 @@ class SURE(nn.Module):
         alpha = self.softmax(alpha)
         return alpha
     
-    def soft_assignments(self, xs, batch_size=1024):
+    def soft_assignments(self, xs, batch_size=1024, show_progress=True):
         """
         Map cells to metacells and return the probabilistic values of metacell assignments
         """
         xs = self.preprocess(xs)
-        xs = convert_to_tensor(xs, device=self.get_device())
+        xs = convert_to_tensor(xs, device='cpu')
         dataset = CustomDataset(xs)
         dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
 
         A = []
-        with tqdm(total=len(dataloader), desc='', unit='batch') as pbar:
+        with tqdm(total=len(dataloader), disable=not show_progress, desc='', unit='batch') as pbar:
             for X_batch, _ in dataloader:
+                X_batch = X_batch.to(self.get_device())
                 a = self._soft_assignments(X_batch)
                 A.append(tensor_to_numpy(a))
                 pbar.update(1)
@@ -745,18 +514,19 @@ class SURE(nn.Module):
         ns = torch.zeros_like(alpha).scatter_(1, ind, 1.0)
         return ns
     
-    def hard_assignments(self, xs, batch_size=1024):
+    def hard_assignments(self, xs, batch_size=1024, show_progress=True):
         """
         Map cells to metacells and return the assigned metacell identities.
         """
         xs = self.preprocess(xs)
-        xs = convert_to_tensor(xs, device=self.get_device())
+        xs = convert_to_tensor(xs, device='cpu')
         dataset = CustomDataset(xs)
         dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
 
         A = []
-        with tqdm(total=len(dataloader), desc='', unit='batch') as pbar:
+        with tqdm(total=len(dataloader), disable=not show_progress, desc='', unit='batch') as pbar:
             for X_batch, _ in dataloader:
+                X_batch = X_batch.to(self.get_device())
                 a = self._hard_assignments(X_batch)
                 A.append(tensor_to_numpy(a))
                 pbar.update(1)
@@ -764,16 +534,21 @@ class SURE(nn.Module):
         A = np.concatenate(A)
         return A
     
-    def preprocess(self, xs):
+    def preprocess(self, xs, threshold=0):
+        if self.loss_func == 'bernoulli':
+            ad = sc.AnnData(xs)
+            binarize(ad, threshold=threshold)
+            xs = ad.X.copy()
+        else:
+            xs = np.round(xs)
+            
         if sparse.issparse(xs):
             xs = xs.toarray()
         return xs 
     
     def fit(self, xs, 
-            us = None, 
-            ys = None,
-            zs = None,
-            num_epochs: int = 200, 
+            cs = None, 
+            num_epochs: int = 100, 
             learning_rate: float = 0.0001, 
             batch_size: int = 256, 
             algo: Literal['adam','rmsprop','adamw'] = 'adam', 
@@ -781,7 +556,9 @@ class SURE(nn.Module):
             weight_decay: float = 0.005, 
             decay_rate: float = 0.9,
             config_enum: str = 'parallel',
-            use_jax: bool = False):
+            threshold: int = 0,
+            use_jax: bool = True,
+            show_progress: bool = True):
         """
         Train the SURE model.
 
@@ -790,9 +567,7 @@ class SURE(nn.Module):
         xs
             Single-cell experssion matrix. It should be a Numpy array or a Pytorch Tensor. Rows are cells and columns are features.
         us
-            Undesired factor matrix. It should be a Numpy array or a Pytorch Tensor. Rows are cells and columns are undesired factors.
-        ys
-            Desired factor matrix. It should be a Numpy array or a Pytorch Tensor. Rows are cells and columns are desired factors.
+            cell-level factor matrix. 
         num_epochs
             Number of training epochs.
         learning_rate
@@ -811,16 +586,12 @@ class SURE(nn.Module):
             If toggled on, Jax will be used for speeding up. CAUTION: This will raise errors because of unknown reasons when it is called in
             the Python script or Jupyter notebook. It is OK if it is used when runing SURE in the shell command.
         """
-        xs = self.preprocess(xs)
-        xs = convert_to_tensor(xs, dtype=self.dtype, device=self.get_device())
-        if us is not None:
-            us = convert_to_tensor(us, dtype=self.dtype, device=self.get_device())
-        if ys is not None:
-            ys = convert_to_tensor(ys, dtype=self.dtype, device=self.get_device())
-        if zs is not None:
-            zs = convert_to_tensor(zs, dtype=self.dtype, device=self.get_device())
+        xs = self.preprocess(xs, threshold=threshold)
+        xs = convert_to_tensor(xs, dtype=self.dtype, device='cpu')
+        if cs is not None:
+            cs = convert_to_tensor(cs, dtype=self.dtype, device='cpu')
 
-        dataset = CustomDataset4(xs, us, ys, zs)
+        dataset = CustomDataset(xs)
         dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
         # setup the optimizer
@@ -842,47 +613,24 @@ class SURE(nn.Module):
         # by enumerating each class label form the sampled discrete categorical distribution in the model
         Elbo = JitTraceEnum_ELBO if use_jax else TraceEnum_ELBO
         elbo = Elbo(max_plate_nesting=1, strict_enumeration_warning=False)
-        if us is None:
-            if ys is None:
-                guide = config_enumerate(self.guide1, config_enum, expand=True)
-                loss_basic = SVI(self.model1, guide, scheduler, loss=elbo)
-            else:
-                guide = config_enumerate(self.guide3, config_enum, expand=True)
-                loss_basic = SVI(self.model3, guide, scheduler, loss=elbo)
-        else:
-            if ys is None:
-                guide = config_enumerate(self.guide2, config_enum, expand=True)
-                loss_basic = SVI(self.model2, guide, scheduler, loss=elbo)
-            else:
-                guide = config_enumerate(self.guide4, config_enum, expand=True)
-                loss_basic = SVI(self.model4, guide, scheduler, loss=elbo)
+        guide = config_enumerate(self.guide, config_enum, expand=True)
+        loss_basic = SVI(self.model, guide, scheduler, loss=elbo)
 
         # build a list of all losses considered
         losses = [loss_basic]
         num_losses = len(losses)
 
-        with tqdm(total=num_epochs, desc='Training', unit='epoch') as pbar:
+        with tqdm(total=num_epochs, disable=not show_progress, desc='Training', unit='epoch') as pbar:
             for epoch in range(num_epochs):
                 epoch_losses = [0.0] * num_losses
-                for batch_x, batch_u, batch_y, batch_z, _ in dataloader:
-                    if us is None:
-                        batch_u = None
-                    if ys is None:
-                        batch_y = None
-                    if zs is None:
-                        batch_z = None
-
+                for batch_x, idx in dataloader:
+                    batch_x = batch_x.to(self.get_device())
                     for loss_id in range(num_losses):
-                        if batch_u is None:
-                            if batch_y is None:
-                                new_loss = losses[loss_id].step(batch_x)
-                            else:
-                                new_loss = losses[loss_id].step(batch_x, batch_y, batch_z)
+                        if cs is None:
+                            new_loss = losses[loss_id].step(batch_x)
                         else:
-                            if batch_y is None:
-                                new_loss = losses[loss_id].step(batch_x, batch_u)
-                            else:
-                                new_loss = losses[loss_id].step(batch_x, batch_u, batch_y, batch_z)
+                            batch_c = cs[idx].to(self.get_device())
+                            new_loss = losses[loss_id].step(batch_x, batch_c)
                         epoch_losses[loss_id] += new_loss
 
                 avg_epoch_losses_ = map(lambda v: v / len(dataloader), epoch_losses)
@@ -894,13 +642,6 @@ class SURE(nn.Module):
                 # Update progress bar
                 pbar.set_postfix({'loss': str_loss})
                 pbar.update(1)
-        
-        assigns = self.soft_assignments(xs)
-        assigns = convert_to_tensor(assigns, dtype=self.dtype, device=self.get_device())
-        self.codebook_weights = torch.sum(assigns, dim=0)
-        self.codebook_weights = self.codebook_weights / torch.sum(self.codebook_weights)
-        #self.inverse_dispersion = pyro.param('inverse_dispersion').item()
-        #self.dof = pyro.param('dof').item()
 
     @classmethod
     def save_model(cls, model, file_path, compression=False):
@@ -964,31 +705,25 @@ def parse_args():
         help="the data file",
     )
     parser.add_argument(
-        "-undesired",
-        "--undesired-factor-file",
+        "-cf",
+        "--covariate-file",
         default=None,
         type=str,
-        help="the file for the record of undesired factors",
+        help="the file for the record of covariates",
     )
     parser.add_argument(
-        "-delta",
-        "--delta",
-        default=0.0,
+        "-bs",
+        "--batch-size",
+        default=1000,
+        type=int,
+        help="number of cells to be considered in a batch",
+    )
+    parser.add_argument(
+        "-lr",
+        "--learning-rate",
+        default=0.0001,
         type=float,
-        help="penalty weight for zero inflation loss",
-    )
-    parser.add_argument(
-        "-64",
-        "--float64",
-        action="store_true",
-        help="use double float precision",
-    )
-    parser.add_argument(
-        "--z-dist",
-        default='normal',
-        type=str,
-        choices=['normal','laplacian','studentt','cauchy'],
-        help="distribution model for latent representation",
+        help="learning rate for Adam optimizer",
     )
     parser.add_argument(
         "-cs",
@@ -1003,6 +738,27 @@ def parse_args():
         default=10,
         type=int,
         help="size of the tensor representing the latent variable z variable",
+    )
+    parser.add_argument(
+        "-likeli",
+        "--likelihood",
+        default='negbinomial',
+        type=str,
+        choices=['negbinomial', 'multinomial', 'poisson', 'bernoulli'],
+        help="specify the distribution likelihood function",
+    )
+    parser.add_argument(
+        "-zi",
+        "--zeroinflate",
+        action="store_true",
+        help="use zeroinflation",
+    )
+    parser.add_argument(
+        "-id",
+        "--inverse-dispersion",
+        default=10.0,
+        type=float,
+        help="inverse dispersion prior for negative binomial",
     )
     parser.add_argument(
         "-hl",
@@ -1038,20 +794,6 @@ def parse_args():
         help="post functions for activation layers, could be none or dropout, default is 'none'",
     )
     parser.add_argument(
-        "-id",
-        "--inverse-dispersion",
-        default=10.0,
-        type=float,
-        help="inverse dispersion prior for negative binomial",
-    )
-    parser.add_argument(
-        "-lr",
-        "--learning-rate",
-        default=0.0001,
-        type=float,
-        help="learning rate for Adam optimizer",
-    )
-    parser.add_argument(
         "-dr",
         "--decay-rate",
         default=0.9,
@@ -1072,47 +814,10 @@ def parse_args():
         help="beta-1 parameter for Adam optimizer",
     )
     parser.add_argument(
-        "-bs",
-        "--batch-size",
-        default=1000,
-        type=int,
-        help="number of cells to be considered in a batch",
-    )
-    parser.add_argument(
-        "-gp",
-        "--gate-prior",
-        default=0.6,
-        type=float,
-        help="gate prior for zero-inflated model",
-    )
-    parser.add_argument(
-        "-likeli",
-        "--likelihood",
-        default='negbinomial',
-        type=str,
-        choices=['negbinomial', 'multinomial', 'poisson', 'gaussian','lognormal'],
-        help="specify the distribution likelihood function",
-    )
-    parser.add_argument(
-        "-dirichlet",
-        "--use-dirichlet",
+        "-64",
+        "--float64",
         action="store_true",
-        help="use Dirichlet distribution over gene frequency",
-    )
-    parser.add_argument(
-        "-mass",
-        "--dirichlet-mass",
-        default=1,
-        type=float,
-        help="mass param for dirichlet model",
-    )
-    parser.add_argument(
-        "-zi",
-        "--zero-inflation",
-        default='exact',
-        type=str,
-        choices=['none','exact','inexact'],
-        help="use zero-inflated estimation",
+        help="use double float precision",
     )
     parser.add_argument(
         "--seed",
@@ -1148,35 +853,28 @@ def main():
 
     xs = dt.fread(file=args.data_file, header=True).to_numpy()
     us = None 
-    if args.undesired_factor_file is not None:
-        us = dt.fread(file=args.undesired_factor_file, header=True).to_numpy()
+    if args.covariate_file is not None:
+        us = dt.fread(file=args.covariate_file, header=True).to_numpy()
 
-    input_size = xs.shape[1]
-    undesired_size = 0 if us is None else us.shape[1]
-
-    latent_dist = args.z_dist
+    input_dim = xs.shape[1]
+    cov_size = 0 if us is None else us.shape[1]
 
     ###########################################
     sure = SURE(
-        input_size=input_size,
-        undesired_size=undesired_size,
-        inverse_dispersion=args.inverse_dispersion,
-        latent_dim=args.latent_dim,
+        input_dim=input_dim,
+        cov_size=cov_size,
+        dispersion=args.dispersion,
+        z_dim=args.z_dim,
         hidden_layers=args.hidden_layers,
         hidden_layer_activation=args.hidden_layer_activation,
         use_cuda=args.cuda,
         config_enum=args.enum_discrete,
-        use_dirichlet=args.use_dirichlet,
-        zero_inflation=args.zero_inflation,
-        gate_prior=args.gate_prior,
-        delta=args.delta,
+        use_zeroinflate=args.zeroinflate,
         loss_func=args.likelihood,
-        dirichlet_mass=args.dirichlet_mass,
         nn_dropout=args.layer_dropout_rate,
         post_layer_fct=args.post_layer_function,
         post_act_fct=args.post_activation_function,
         codebook_size=args.codebook_size,
-        latent_dist = latent_dist,
         dtype=dtype,
     )
 
